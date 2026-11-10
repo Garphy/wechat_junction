@@ -1,0 +1,17 @@
+// The dialog strings below are encoded as UTF-8.
+#pragma code_page(65001)
+#include <winuser.h>
+#include "resource.h"
+
+1 RT_MANIFEST "app.manifest"
+
+IDD_RENAME DIALOGEX 0, 0, 225, 64
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "重命名"
+FONT 9, "Microsoft YaHei UI"
+BEGIN
+    LTEXT "新名称", -1, 8, 9, 36, 10
+    EDITTEXT IDC_NEW_NAME, 45, 7, 172, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON "确定", IDOK, 108, 40, 51, 15
+    PUSHBUTTON "取消", IDCANCEL, 166, 40, 51, 15
+END

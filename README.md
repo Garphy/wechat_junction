@@ -24,7 +24,9 @@ powershell -File .\build.ps1 -Test
 .\build.ps1 -ZigRoot .\build\.toolchain\zig-x86_64-windows-0.17.1 -Test
 ```
 
-`-Test` 使用临时目录验证中文文件名、修改时间排序、月路径解析、自动创建目录、目录重命名和文件变更通知。如果旧版 EXE 正在运行，可用 `-OutputDirectory` 指定不同的输出目录。设置存储在当前用户的 `HKCU\Software\DesktopJunction`。
+`-Test` 使用临时目录验证文件列表、自动换月、资源释放及 INI 设置的读写。如果旧版 EXE 正在运行，可用 `-OutputDirectory` 指定不同的输出目录。
+
+设置保存在 EXE 同目录的 `DesktopJunction.ini`。迁移应用时可将 EXE 和 INI 一起复制，INI 中的映射路径需要在目标电脑上可用。没有 INI 时，新版会尝试导入旧版在 `HKCU\Software\DesktopJunction` 中保存的设置。EXE 所在目录需要可写。
 
 ## 桌面验收
 

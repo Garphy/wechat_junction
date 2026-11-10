@@ -1,13 +1,14 @@
 #include "desktop.h"
 #include "folder.h"
+#include "panel_canvas.h"
+#include "resource.h"
+#include "settings.h"
 #include "shell.h"
 
 #include <windowsx.h>
 #include <oleacc.h>
 
 #include <algorithm>
-#include <cstdint>
-#include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,70 +17,12 @@
 namespace {
 constexpr wchar_t appName[] = L"桌面文件夹映射";
 constexpr wchar_t windowClass[] = L"DesktopJunction.Panel";
-constexpr wchar_t settingsKey[] = L"Software\\DesktopJunction";
 constexpr UINT trayMessage = WM_APP + 3;
 constexpr UINT showMessage = WM_APP + 4;
 constexpr UINT chooseMessage = WM_APP + 5;
 constexpr UINT paintMessage = WM_APP + 6;
 constexpr UINT_PTR monthTimer = 2;
 constexpr int pinId = 200, chooseId = 201, listId = 202, closeId = 203;
-constexpr COLORREF canvasKey = RGB(2, 1, 2);
-
-class PanelCanvas {
-public:
-    ~PanelCanvas() {
-        if (original_) SelectObject(dc_, original_);
-        if (bitmap_) DeleteObject(bitmap_);
-        if (dc_) DeleteDC(dc_);
-    }
-
-    HDC Prepare(LONG width, LONG height) {
-        if (width <= 0 || height <= 0) return nullptr;
-        if (!dc_) dc_ = CreateCompatibleDC(nullptr);
-        if (!dc_) return nullptr;
-        if (!bitmap_ || size_.cx != width || size_.cy != height) {
-            BITMAPINFO info{};
-            info.bmiHeader.biSize = sizeof(info.bmiHeader);
-            info.bmiHeader.biWidth = width;
-            info.bmiHeader.biHeight = -height;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            void* bits = nullptr;
-            HBITMAP next = CreateDIBSection(dc_, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-            if (!next) return nullptr;
-            auto previous = SelectObject(dc_, next);
-            if (bitmap_) DeleteObject(bitmap_);
-            else original_ = previous;
-            bitmap_ = next;
-            pixels_ = static_cast<std::uint32_t*>(bits);
-            size_ = {width, height};
-        }
-        GdiFlush();
-        std::fill_n(pixels_, PixelCount(), canvasKey);
-        return dc_;
-    }
-
-    void Present(HWND window) {
-        GdiFlush();
-        for (size_t i = 0; i < PixelCount(); ++i) {
-            auto color = pixels_[i] & 0x00FFFFFF;
-            // Alpha zero is click-through. Alpha one is visually negligible and keeps the hit area.
-            pixels_[i] = color == canvasKey ? 0x01000000 : color | 0xFF000000;
-        }
-        POINT source{};
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        UpdateLayeredWindow(window, nullptr, nullptr, &size_, dc_, &source, 0, &blend, ULW_ALPHA);
-    }
-
-private:
-    size_t PixelCount() const { return size_t(size_.cx) * size_.cy; }
-    HDC dc_ = nullptr;
-    HBITMAP bitmap_ = nullptr;
-    HGDIOBJ original_ = nullptr;
-    std::uint32_t* pixels_ = nullptr;
-    SIZE size_{};
-};
-
 void DrawPill(HDC dc, const RECT& area, int radius, COLORREF fill) {
     auto brush = SelectObject(dc, GetStockObject(DC_BRUSH));
     auto pen = SelectObject(dc, GetStockObject(NULL_PEN));
@@ -98,64 +41,6 @@ void DrawDesktopLabel(HDC dc, const wchar_t* text, RECT area, COLORREF color, UI
     DrawTextW(dc, text, -1, &shadow, flags);
     SetTextColor(dc, color);
     DrawTextW(dc, text, -1, &area, flags);
-}
-
-struct Settings {
-    folder::Source source;
-    RECT bounds{};
-    UINT dpi = USER_DEFAULT_SCREEN_DPI;
-    bool pinned = false;
-};
-
-struct StoredSettings {
-    DWORD version;
-    DWORD flags;
-    RECT bounds;
-    UINT dpi;
-};
-
-Settings LoadSettings() {
-    Settings result;
-    DWORD size = 0;
-    if (RegGetValueW(HKEY_CURRENT_USER, settingsKey, L"Settings", RRF_RT_REG_BINARY,
-        nullptr, nullptr, &size) != ERROR_SUCCESS || size < sizeof(StoredSettings) ||
-        size > sizeof(StoredSettings) + 32768 * sizeof(wchar_t)) return result;
-    std::vector<BYTE> bytes(size);
-    if (RegGetValueW(HKEY_CURRENT_USER, settingsKey, L"Settings", RRF_RT_REG_BINARY,
-        nullptr, bytes.data(), &size) != ERROR_SUCCESS || size < sizeof(StoredSettings) ||
-        (size - sizeof(StoredSettings)) % sizeof(wchar_t)) return result;
-    StoredSettings stored{};
-    std::memcpy(&stored, bytes.data(), sizeof(stored));
-    if (stored.version != 1) return result;
-    std::wstring path((size - sizeof(stored)) / sizeof(wchar_t), L'\0');
-    std::memcpy(path.data(), bytes.data() + sizeof(stored), size - sizeof(stored));
-    if (path.find(L'\0') == std::wstring::npos) {
-        if (auto source = folder::MakeSource(path, false)) result.source = std::move(*source);
-    }
-    result.source.monthly = (stored.flags & 1) != 0 && !result.source.path.empty();
-    result.pinned = (stored.flags & 2) != 0;
-    auto width = static_cast<long long>(stored.bounds.right) - stored.bounds.left;
-    auto height = static_cast<long long>(stored.bounds.bottom) - stored.bounds.top;
-    if (width > 0 && height > 0 && width < 65536 && height < 65536 &&
-        stored.dpi >= 48 && stored.dpi <= 768) {
-        result.bounds = stored.bounds;
-        result.dpi = stored.dpi;
-    }
-    return result;
-}
-
-bool WriteSettings(const Settings& settings) {
-    StoredSettings stored{1, (settings.source.monthly ? 1u : 0u) | (settings.pinned ? 2u : 0u),
-        settings.bounds, settings.dpi};
-    std::vector<BYTE> bytes(sizeof(stored) + settings.source.path.size() * sizeof(wchar_t));
-    std::memcpy(bytes.data(), &stored, sizeof(stored));
-    std::memcpy(bytes.data() + sizeof(stored), settings.source.path.data(), bytes.size() - sizeof(stored));
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, settingsKey, 0, nullptr, 0, KEY_SET_VALUE,
-        nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
-    auto status = RegSetValueExW(key, L"Settings", 0, REG_BINARY, bytes.data(), static_cast<DWORD>(bytes.size()));
-    RegCloseKey(key);
-    return status == ERROR_SUCCESS;
 }
 
 RECT FitToScreen(RECT bounds) {
@@ -183,7 +68,12 @@ RECT DefaultBounds() {
 
 class Panel {
 public:
-    explicit Panel(HINSTANCE instance) : instance_(instance), settings_(LoadSettings()) {}
+    explicit Panel(HINSTANCE instance) : instance_(instance), settingsPath_(settings::FilePath()),
+        settings_(settings::Load(settingsPath_, importedSettings_)) {}
+    ~Panel() {
+        if (window_) DestroyWindow(window_);
+        if (trayIcon_) DestroyIcon(trayIcon_);
+    }
     bool Create();
     void Start();
 
@@ -235,12 +125,15 @@ private:
     }
 
     HINSTANCE instance_;
-    Settings settings_;
+    std::wstring settingsPath_;
+    bool importedSettings_ = false;
+    settings::Values settings_;
     HWND window_ = nullptr, list_ = nullptr, pin_ = nullptr, choose_ = nullptr, close_ = nullptr;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     UINT taskbarCreated_ = 0;
-    HFONT font_ = nullptr;
+    HFONT font_ = nullptr, iconFont_ = nullptr;
     HICON icon_ = nullptr;
+    HICON trayIcon_ = nullptr;
     COLORREF textColor_ = RGB(255, 255, 255);
     PanelCanvas canvas_;
     SIZE layoutSize_{};
@@ -256,7 +149,9 @@ private:
 };
 
 bool Panel::Create() {
-    icon_ = LoadIconW(nullptr, IDI_APPLICATION);
+    icon_ = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_DESKTOP_JUNCTION));
+    if (!icon_) icon_ = LoadIconW(nullptr, IDI_APPLICATION);
+    LoadIconMetric(instance_, MAKEINTRESOURCEW(IDI_DESKTOP_JUNCTION), LIM_SMALL, &trayIcon_);
     WNDCLASSW wc{};
     wc.hInstance = instance_;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -286,8 +181,8 @@ void Panel::Start() {
     }
     AddTray();
     RefreshSource();
-    PaintFrame();
     Show(false);
+    if (importedSettings_) Save(true);
     if (settings_.source.path.empty()) PostMessageW(window_, chooseMessage, 0, 0);
 }
 
@@ -298,7 +193,7 @@ bool Panel::CreateControls() {
     };
     choose_ = child(WC_BUTTONW, L"设置", BS_PUSHBUTTON | WS_TABSTOP, chooseId);
     pin_ = child(WC_BUTTONW, L"置顶", BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, pinId);
-    close_ = child(WC_BUTTONW, L"×", BS_PUSHBUTTON | WS_TABSTOP, closeId);
+    close_ = child(WC_BUTTONW, L"关闭", BS_PUSHBUTTON | WS_TABSTOP, closeId);
     list_ = child(WC_LISTVIEWW, L"", LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS |
         LVS_NOCOLUMNHEADER | LVS_SHAREIMAGELISTS | WS_TABSTOP, listId);
     if (!choose_ || !pin_ || !close_ || !list_) return false;
@@ -311,8 +206,22 @@ bool Panel::CreateControls() {
     column.mask = LVCF_WIDTH;
     ListView_InsertColumn(list_, 0, &column);
     SetWindowSubclass(list_, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
-    for (HWND button : {choose_, pin_, close_}) {
+    HWND tips = CreateWindowExW(WS_EX_TOOLWINDOW, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+    const std::pair<HWND, const wchar_t*> buttons[] = {
+        {choose_, L"设置目录"}, {pin_, L"切换置顶"}, {close_, L"关闭"},
+    };
+    for (const auto& [button, description] : buttons) {
         SetWindowSubclass(button, ButtonProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        if (tips) {
+            TOOLINFOW tool{};
+            tool.cbSize = sizeof(tool);
+            tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            tool.hwnd = window_;
+            tool.uId = reinterpret_cast<UINT_PTR>(button);
+            tool.lpszText = const_cast<wchar_t*>(description);
+            SendMessageW(tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
     }
     SendMessageW(pin_, BM_SETCHECK, settings_.pinned ? BST_CHECKED : BST_UNCHECKED, 0);
     dpi_ = GetDpiForWindow(window_);
@@ -322,6 +231,14 @@ bool Panel::CreateControls() {
 }
 
 void Panel::UpdateFont() {
+    LOGFONTW symbol{};
+    symbol.lfHeight = -Dip(14);
+    symbol.lfQuality = NONANTIALIASED_QUALITY;
+    wcscpy_s(symbol.lfFaceName, L"Segoe MDL2 Assets");
+    if (HFONT font = CreateFontIndirectW(&symbol)) {
+        if (iconFont_) DeleteObject(iconFont_);
+        iconFont_ = font;
+    }
     LOGFONTW label{};
     if (!SystemParametersInfoW(SPI_GETICONTITLELOGFONT, sizeof(label), &label, 0)) return;
     label.lfHeight = MulDiv(label.lfHeight, dpi_, GetDpiForSystem());
@@ -338,8 +255,8 @@ void Panel::UpdateFont() {
 }
 
 void Panel::UpdateAppearance() {
-    textColor_ = DesktopLayer::TextColor();
-    RequestPaint();
+    COLORREF color = DesktopLayer::TextColor();
+    if (std::exchange(textColor_, color) != color) RequestPaint();
 }
 
 LRESULT Panel::HitTest(POINT point) const {
@@ -361,7 +278,7 @@ LRESULT Panel::HitTest(POINT point) const {
 }
 
 void Panel::PaintFrame() {
-    if (!list_ || IsIconic(window_)) return;
+    if (!list_ || !IsWindowVisible(window_) || IsIconic(window_)) return;
     RECT area{};
     GetClientRect(window_, &area);
     HDC dc = canvas_.Prepare(area.right, area.bottom);
@@ -374,11 +291,13 @@ void Panel::PaintFrame() {
 }
 
 void Panel::RequestPaint() {
-    if (!paintPending_) paintPending_ = PostMessageW(window_, paintMessage, 0, 0) != FALSE;
+    if (!paintPending_ && IsWindowVisible(window_)) {
+        paintPending_ = PostMessageW(window_, paintMessage, 0, 0) != FALSE;
+    }
 }
 
 void Panel::DrawToolbar(HDC dc, const RECT& area) {
-    RECT title{Dip(10), 0, area.right - Dip(122), HeaderHeight()};
+    RECT title{Dip(10), 0, area.right - Dip(104), HeaderHeight()};
     HGDIOBJ old = font_ ? SelectObject(dc, font_) : nullptr;
     const wchar_t* label = snapshot_.error ? L"目录暂不可用" :
         settings_.source.monthly ? L"微信附件" : L"桌面文件夹";
@@ -396,9 +315,18 @@ void Panel::DrawToolbar(HDC dc, const RECT& area) {
             DrawPill(dc, bounds, Dip(8), fill);
         }
         if (GetFocus() == button) DrawFocusRect(dc, &bounds);
-        const wchar_t* text = button == close_ ? L"×" : button == pin_ ? L"置顶" : L"设置";
+        const wchar_t* text = L"×";
+        HGDIOBJ previous = nullptr;
+        if (button != close_) {
+            text = button == pin_ ? L"置顶" : L"设置";
+            if (iconFont_) {
+                previous = SelectObject(dc, iconFont_);
+                if (previous) text = button == choose_ ? L"\uE713" : pinned ? L"\uE77A" : L"\uE718";
+            }
+        }
         DrawDesktopLabel(dc, text, bounds, (pressed || hover || pinned) ? RGB(255, 255, 255) : textColor_,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        if (previous) SelectObject(dc, previous);
     }
     if (old) SelectObject(dc, old);
 }
@@ -445,8 +373,8 @@ void Panel::Layout() {
     int width = std::max(0, int(area.right) - 2 * padding);
     int right = area.right - padding;
     MoveWindow(close_, right - Dip(24), buttonTop, Dip(24), buttonHeight, TRUE);
-    MoveWindow(pin_, right - Dip(66), buttonTop, Dip(40), buttonHeight, TRUE);
-    MoveWindow(choose_, right - Dip(108), buttonTop, Dip(40), buttonHeight, TRUE);
+    MoveWindow(pin_, right - Dip(57), buttonTop, Dip(30), buttonHeight, TRUE);
+    MoveWindow(choose_, right - Dip(90), buttonTop, Dip(30), buttonHeight, TRUE);
     int top = HeaderHeight();
     MoveWindow(list_, padding, top, width, std::max(0, int(area.bottom) - top - padding), TRUE);
     FitColumn();
@@ -478,8 +406,9 @@ void Panel::Save(bool report) {
         GetWindowRect(window_, &settings_.bounds);
         settings_.dpi = dpi_;
     }
-    if (!WriteSettings(settings_) && report) {
-        MessageBoxW(window_, L"设置已在本次运行生效，但无法保存到当前用户。", appName, MB_OK | MB_ICONWARNING);
+    if (!settings::Write(settingsPath_, settings_) && report) {
+        MessageBoxW(window_, L"无法写入 EXE 同目录的 DesktopJunction.ini。请确认目录可写。",
+            appName, MB_OK | MB_ICONWARNING);
     }
 }
 
@@ -490,7 +419,7 @@ void Panel::AddTray() {
     tray.uID = 1;
     tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray.uCallbackMessage = trayMessage;
-    tray.hIcon = icon_;
+    tray.hIcon = trayIcon_ ? trayIcon_ : icon_;
     wcscpy_s(tray.szTip, appName);
     trayAdded_ = Shell_NotifyIconW(NIM_ADD, &tray) != FALSE;
 }
@@ -516,6 +445,7 @@ void Panel::TrayMenu() {
 void Panel::Show(bool activate) {
     FitCurrent();
     ShowWindow(window_, SW_SHOWNOACTIVATE);
+    RequestPaint();
     if (activate) {
         SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
         revealed_ = SetForegroundWindow(window_) || GetForegroundWindow() == window_;
@@ -622,10 +552,9 @@ void Panel::FillDisplayInfo(NMLVDISPINFOW& info) {
 
 void Panel::DrawRow(HDC dc, int row) {
     const auto& entry = snapshot_.entries[row];
-    RECT label{}, icon{}, bounds{};
+    RECT label{}, icon{};
     ListView_GetItemRect(list_, row, &label, LVIR_LABEL);
     ListView_GetItemRect(list_, row, &icon, LVIR_ICON);
-    ListView_GetItemRect(list_, row, &bounds, LVIR_BOUNDS);
     auto images = ListView_GetImageList(list_, LVSIL_SMALL);
     if (images) ImageList_Draw(images, Icon(entry), dc, icon.left, icon.top, ILD_TRANSPARENT);
     HGDIOBJ old = font_ ? SelectObject(dc, font_) : nullptr;
@@ -633,10 +562,12 @@ void Panel::DrawRow(HDC dc, int row) {
         DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
     if (old) SelectObject(dc, old);
     auto state = ListView_GetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED);
-    if (state & LVIS_SELECTED) {
-        FrameRect(dc, &bounds, GetSysColorBrush(COLOR_HIGHLIGHT));
-    } else if (GetFocus() == list_ && (state & LVIS_FOCUSED)) {
-        DrawFocusRect(dc, &bounds);
+    if ((state & LVIS_SELECTED) || (GetFocus() == list_ && (state & LVIS_FOCUSED))) {
+        RECT bounds{};
+        if (ListView_GetItemRect(list_, row, &bounds, LVIR_BOUNDS)) {
+            if (state & LVIS_SELECTED) FrameRect(dc, &bounds, GetSysColorBrush(COLOR_HIGHLIGHT));
+            else DrawFocusRect(dc, &bounds);
+        }
     }
 }
 
@@ -802,6 +733,9 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         PaintFrame();
         return 0;
     case WM_ERASEBKGND: return TRUE;
+    case WM_SHOWWINDOW:
+        if (!wParam) canvas_.Reset();
+        break;
     case WM_GETMINMAXINFO: {
         auto& limits = *reinterpret_cast<MINMAXINFO*>(lParam);
         limits.ptMinTrackSize = {Dip(280), Dip(180)};
@@ -825,12 +759,14 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             UpdateFont();
             Layout();
         }
-        UpdateAppearance();
+        if (!wParam || wParam == SPI_SETDESKWALLPAPER || wParam == SPI_SETHIGHCONTRAST) UpdateAppearance();
         if (wParam == SPI_SETWORKAREA) FitCurrent();
         if (lParam && !wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"intl")) RefreshSource();
         break;
     case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
         UpdateAppearance();
+        RequestPaint();
         break;
     case WM_EXITSIZEMOVE:
         FitCurrent();
@@ -921,10 +857,13 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         PostQuitMessage(0);
         return 0;
     }
-    case WM_NCDESTROY:
+    case WM_NCDESTROY: {
+        HWND window = std::exchange(window_, nullptr);
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         if (font_) DeleteObject(font_);
-        SetWindowLongPtrW(window_, GWLP_USERDATA, 0);
-        break;
+        if (iconFont_) DeleteObject(iconFont_);
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
     }
     return DefWindowProcW(window_, message, wParam, lParam);
 }

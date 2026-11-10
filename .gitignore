@@ -8,3 +8,5 @@
 *.exe
 *.user
 *.suo
+DesktopJunction.ini
+DesktopJunction.ini.*.tmp

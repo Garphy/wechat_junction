@@ -3,11 +3,16 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <system_error>
 #include <utility>
 
 namespace folder {
 namespace {
+struct FindCloser {
+    void operator()(HANDLE handle) const { FindClose(handle); }
+};
+
 std::wstring NativePath(const std::wstring& path) {
     if (path.starts_with(L"\\\\?\\")) return path;
     if (path.starts_with(L"\\\\")) return L"\\\\?\\UNC\\" + path.substr(2);
@@ -127,6 +132,7 @@ Snapshot Read(const std::wstring& path) {
         if (error != ERROR_FILE_NOT_FOUND || !IsDirectory(path)) result.error = error;
         return result;
     }
+    std::unique_ptr<void, FindCloser> enumeration(search);
     do {
         std::wstring name(data.cFileName);
         if (name != L"." && name != L"..") {
@@ -134,7 +140,7 @@ Snapshot Read(const std::wstring& path) {
         }
     } while (FindNextFileW(search, &data));
     DWORD error = GetLastError();
-    FindClose(search);
+    enumeration.reset();
     if (error != ERROR_NO_MORE_FILES) {
         result.error = error;
         result.entries.clear();
@@ -202,6 +208,7 @@ void Monitor::Run() {
         bool createMissing;
         {
             std::lock_guard lock(mutex_);
+            ResetEvent(changed_);
             path = path_;
             generation = generation_;
             createMissing = createMissing_;

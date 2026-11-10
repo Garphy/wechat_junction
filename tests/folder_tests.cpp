@@ -1,4 +1,6 @@
 #include "../src/folder.h"
+#include "../src/panel_canvas.h"
+#include "../src/settings.h"
 
 #include <algorithm>
 #include <chrono>
@@ -122,13 +124,67 @@ void Test(const std::filesystem::path& root) {
     }
     DestroyWindow(receiver);
 }
+
+void TestResources(const std::filesystem::path& root) {
+    HWND receiver = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    Check(receiver != nullptr, "create resource test receiver");
+    auto process = GetCurrentProcess();
+    DWORD handlesBefore = 0;
+    Check(GetProcessHandleCount(process, &handlesBefore), "read baseline handle count");
+    auto gdiBefore = GetGuiResources(process, GR_GDIOBJECTS);
+    for (unsigned cycle = 0; cycle < 16; ++cycle) {
+        folder::Monitor monitor(receiver);
+        monitor.SetPath(root.wstring(), cycle + 1);
+        WaitFor(monitor, [](const auto& snapshot) { return !snapshot.error; });
+        PanelCanvas canvas;
+        for (int width = 96; width < 112; ++width) {
+            Check(canvas.Prepare(width, 64) != nullptr, "resize canvas");
+        }
+        canvas.Reset();
+        Check(canvas.Prepare(112, 64) != nullptr, "restore canvas after releasing it");
+    }
+    DWORD handlesAfter = 0;
+    Check(GetProcessHandleCount(process, &handlesAfter) && handlesAfter == handlesBefore,
+        "directory monitor released its handles");
+    Check(GetGuiResources(process, GR_GDIOBJECTS) == gdiBefore, "canvas released its GDI objects");
+    DestroyWindow(receiver);
+}
+
+void TestSettings(const std::filesystem::path& root) {
+    auto ini = root / L"DesktopJunction.ini";
+    settings::Values original;
+    original.source = {(root / L"微信=附件").wstring(), true};
+    original.bounds = {-700, 48, -240, 580};
+    original.dpi = 144;
+    original.pinned = true;
+    Check(settings::Write(ini.wstring(), original), "write portable INI");
+    bool imported = true;
+    auto loaded = settings::Load(ini.wstring(), imported);
+    Check(!imported && loaded.source.path == original.source.path && loaded.source.monthly,
+        "INI takes precedence and preserves the Unicode path and mapping mode");
+    Check(EqualRect(&loaded.bounds, &original.bounds) && loaded.dpi == 144 && loaded.pinned,
+        "INI preserves negative monitor coordinates, DPI and pin");
+
+    original.source.monthly = false;
+    original.pinned = false;
+    Check(settings::Write(ini.wstring(), original), "replace existing INI");
+    loaded = settings::Load(ini.wstring(), imported);
+    Check(!loaded.source.monthly && !loaded.pinned, "INI reloads changed options");
+    Check(!std::filesystem::exists(ini.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp"),
+        "save leaves no temporary file");
+    Check(!settings::Write((root / L"missing" / ini.filename()).wstring(), original),
+        "saving fails cleanly when the target directory is unavailable");
+}
 }
 
 int main() {
     try {
         Fixture fixture;
         Test(fixture.path);
-        std::cout << "Folder tests passed\n";
+        TestResources(fixture.path);
+        TestSettings(fixture.path);
+        std::cout << "Folder, resource, and settings tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

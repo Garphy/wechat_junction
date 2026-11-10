@@ -5,11 +5,11 @@ $src = Join-Path $PSScriptRoot 'src'
 $build = Join-Path $PSScriptRoot 'build'
 $out = if ($OutputDirectory) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory) } else { $build }
 $null = [IO.Directory]::CreateDirectory($out)
-$sources = @('main.cpp', 'desktop.cpp', 'folder.cpp', 'shell.cpp') | ForEach-Object { Join-Path $src $_ }
+$sources = @('main.cpp', 'desktop.cpp', 'folder.cpp', 'settings.cpp', 'shell.cpp') | ForEach-Object { Join-Path $src $_ }
 $libs = @('user32', 'gdi32', 'comctl32', 'shell32', 'ole32', 'uuid', 'advapi32', 'shlwapi')
 $exe = Join-Path $out 'DesktopJunction.exe'
 $testExe = Join-Path $out 'FolderTests.exe'
-$testSources = @((Join-Path $PSScriptRoot 'tests\folder_tests.cpp'), (Join-Path $src 'folder.cpp'))
+$testSources = @((Join-Path $PSScriptRoot 'tests\folder_tests.cpp'), (Join-Path $src 'folder.cpp'), (Join-Path $src 'settings.cpp'))
 
 function Invoke-BuildTool($tool, $arguments) {
     & $tool @arguments

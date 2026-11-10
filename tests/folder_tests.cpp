@@ -101,7 +101,24 @@ void Test(const std::filesystem::path& root) {
         });
         monitor.SetPath((root / L"2027-01").wstring(), 2);
         auto switched = WaitFor(monitor, [](const auto& snapshot) { return snapshot.generation == 2; });
-        Check(unavailable(switched) && switched.entries.empty(), "source switch does not publish stale rows");
+        Check(unavailable(switched) && switched.entries.empty() &&
+            !std::filesystem::exists(root / L"2027-01"), "fixed mode leaves missing paths alone");
+
+        auto parent = root / L"attachments";
+        auto automatic = parent / L"2027-01";
+        monitor.SetPath(automatic.wstring(), 3, true);
+        WaitFor(monitor, [&](const auto& snapshot) { return snapshot.generation == 3 && unavailable(snapshot); });
+        Check(!std::filesystem::exists(parent), "automatic mode does not create missing parents");
+        std::filesystem::create_directory(parent);
+        WaitFor(monitor, [](const auto& snapshot) { return snapshot.generation == 3 && !snapshot.error; });
+        Check(std::filesystem::is_directory(automatic), "automatic mode creates only the month directory");
+
+        auto collision = parent / L"2027-02";
+        CreateFileWithTime(collision, 4);
+        monitor.SetPath(collision.wstring(), 4, true);
+        auto failed = WaitFor(monitor, [](const auto& snapshot) { return snapshot.generation == 4; });
+        Check(failed.error == ERROR_DIRECTORY && std::filesystem::is_regular_file(collision),
+            "automatic mode preserves a file at the month path");
     }
     DestroyWindow(receiver);
 }

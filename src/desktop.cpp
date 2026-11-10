@@ -1,5 +1,6 @@
 #include "desktop.h"
 
+#include <commctrl.h>
 #include <cwchar>
 
 namespace {
@@ -58,6 +59,21 @@ DesktopLayer::~DesktopLayer() {
 void DesktopLayer::Settle() {
     // Explorer may finish rearranging its windows after sending the foreground event.
     SetTimer(panel_, settleTimer, 160, nullptr);
+}
+
+COLORREF DesktopLayer::TextColor() {
+    HWND host = nullptr;
+    EnumWindows(FindIconHost, reinterpret_cast<LPARAM>(&host));
+    if (host) {
+        HWND view = FindWindowExW(host, nullptr, L"SHELLDLL_DefView", nullptr);
+        HWND icons = view ? FindWindowExW(view, nullptr, WC_LISTVIEWW, nullptr) : nullptr;
+        DWORD_PTR color = 0;
+        if (icons && SendMessageTimeoutW(icons, LVM_GETTEXTCOLOR, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &color) && color <= 0xFFFFFF) {
+            return static_cast<COLORREF>(color);
+        }
+    }
+    return RGB(255, 255, 255);
 }
 
 void DesktopLayer::Update(bool pinned) {

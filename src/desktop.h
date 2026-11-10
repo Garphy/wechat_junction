@@ -14,6 +14,7 @@ public:
 
     void Update(bool pinned);
     void Settle();
+    static COLORREF TextColor();
 
 private:
     HWND panel_;

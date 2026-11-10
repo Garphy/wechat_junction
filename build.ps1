@@ -1,8 +1,9 @@
-param([string]$ZigRoot, [switch]$Test)
+param([string]$ZigRoot, [switch]$Test, [string]$OutputDirectory)
 
 $ErrorActionPreference = 'Stop'
 $src = Join-Path $PSScriptRoot 'src'
-$out = Join-Path $PSScriptRoot 'build'
+$build = Join-Path $PSScriptRoot 'build'
+$out = if ($OutputDirectory) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory) } else { $build }
 $null = [IO.Directory]::CreateDirectory($out)
 $sources = @('main.cpp', 'desktop.cpp', 'folder.cpp', 'shell.cpp') | ForEach-Object { Join-Path $src $_ }
 $libs = @('user32', 'gdi32', 'comctl32', 'shell32', 'ole32', 'uuid', 'advapi32', 'shlwapi')
@@ -18,8 +19,8 @@ function Invoke-BuildTool($tool, $arguments) {
 if ($ZigRoot) {
     $zig = Join-Path $ZigRoot 'zig.exe'
     $res = Join-Path $out 'app.res'
-    $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $out 'zig-cache'
-    $env:ZIG_LOCAL_CACHE_DIR = Join-Path $out 'zig-local'
+    $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $build 'zig-cache'
+    $env:ZIG_LOCAL_CACHE_DIR = Join-Path $build 'zig-local'
     $flags = @('c++', '-target', 'x86_64-windows-gnu', '-std=c++20', '-O2', '-Wall', '-Wextra',
         '-DUNICODE', '-D_UNICODE', '-DNOMINMAX')
     Invoke-BuildTool $zig @('rc', '/I', $src, '/FO', $res, (Join-Path $src 'app.rc'))

@@ -42,7 +42,7 @@ public:
     Monitor(const Monitor&) = delete;
     Monitor& operator=(const Monitor&) = delete;
 
-    void SetPath(std::wstring path, unsigned generation);
+    void SetPath(std::wstring path, unsigned generation, bool createMissing = false);
     std::optional<Snapshot> Take();
 
 private:
@@ -55,6 +55,7 @@ private:
     std::mutex mutex_;
     std::wstring path_;
     unsigned generation_ = 0;
+    bool createMissing_ = false;
     std::optional<Snapshot> pending_;
     std::thread worker_;
 };

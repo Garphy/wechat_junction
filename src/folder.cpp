@@ -24,6 +24,13 @@ bool IsDirectory(const std::wstring& path) {
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+DWORD EnsureDirectory(const std::wstring& path) {
+    if (IsDirectory(path) || CreateDirectoryW(NativePath(path).c_str(), nullptr)) return ERROR_SUCCESS;
+    DWORD error = GetLastError();
+    if (error == ERROR_ALREADY_EXISTS) return IsDirectory(path) ? ERROR_SUCCESS : ERROR_DIRECTORY;
+    return error;
+}
+
 class Watch {
 public:
     Watch(const std::wstring& path, DWORD filter) {
@@ -166,10 +173,11 @@ Monitor::~Monitor() {
     CloseHandle(changed_);
 }
 
-void Monitor::SetPath(std::wstring path, unsigned generation) {
+void Monitor::SetPath(std::wstring path, unsigned generation, bool createMissing) {
     std::lock_guard lock(mutex_);
     path_ = std::move(path);
     generation_ = generation;
+    createMissing_ = createMissing;
     pending_.reset();
     SetEvent(changed_);
 }
@@ -191,10 +199,12 @@ void Monitor::Run() {
     for (;;) {
         std::wstring path;
         unsigned generation;
+        bool createMissing;
         {
             std::lock_guard lock(mutex_);
             path = path_;
             generation = generation_;
+            createMissing = createMissing_;
         }
 
         HANDLE events[4] = {stop_, changed_};
@@ -205,14 +215,16 @@ void Monitor::Run() {
 
         auto parent = Parent(path);
         while (!parent.empty() && !IsDirectory(parent)) parent = Parent(parent);
+        Watch ancestor(parent, FILE_NOTIFY_CHANGE_DIR_NAME);
+        DWORD error = createMissing ? EnsureDirectory(path) : ERROR_SUCCESS;
         Watch directory(path, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
             FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_ATTRIBUTES);
-        Watch ancestor(parent, FILE_NOTIFY_CHANGE_DIR_NAME);
         DWORD count = 2;
         if (directory.Event()) events[count++] = directory.Event();
         if (ancestor.Event()) events[count++] = ancestor.Event();
 
         Snapshot snapshot = Read(path);
+        if (snapshot.error != ERROR_SUCCESS && error != ERROR_SUCCESS) snapshot.error = error;
         snapshot.generation = generation;
         bool missing = snapshot.error == ERROR_PATH_NOT_FOUND || snapshot.error == ERROR_FILE_NOT_FOUND;
         bool healthy = snapshot.error == ERROR_SUCCESS && directory.Event();

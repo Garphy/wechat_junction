@@ -92,6 +92,15 @@ Values ReadIni(const std::wstring& path) {
         if (section == L"[Mapping]" && key == L"Path") source = std::move(value);
         if (section == L"[Mapping]" && key == L"Mode") monthly = value == L"Monthly";
         if (section == L"[Panel]" && key == L"Pinned") values.pinned = value == L"1";
+        if (section == L"[Panel]" && key == L"Monitor" && value.size() < 128 &&
+            value.find(L'\0') == std::wstring::npos) values.monitor = std::move(value);
+        if (section == L"[Panel]" && key == L"WorkOrigin") {
+            POINT parsed{};
+            wchar_t comma{};
+            std::wistringstream coordinates(value);
+            if (coordinates >> parsed.x >> comma >> parsed.y && comma == L',' &&
+                (coordinates >> std::ws).eof()) values.workOrigin = parsed;
+        }
         if (section == L"[Panel]" && key == L"Dpi") {
             std::wistringstream number(value);
             if (!(number >> dpi) || !(number >> std::ws).eof()) dpi = USER_DEFAULT_SCREEN_DPI;
@@ -106,6 +115,10 @@ Values ReadIni(const std::wstring& path) {
     }
     SetSource(values, source, monthly);
     SetBounds(values, bounds, dpi);
+    if (IsRectEmpty(&values.bounds) || values.monitor.empty() || !values.workOrigin) {
+        values.monitor.clear();
+        values.workOrigin.reset();
+    }
     return values;
 }
 }
@@ -139,6 +152,10 @@ bool Write(const std::wstring& path, const Values& values) {
         L"\r\n\r\n[Panel]\r\nBounds=" + std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) +
         L"," + std::to_wstring(rect.right) + L"," + std::to_wstring(rect.bottom) +
         L"\r\nDpi=" + std::to_wstring(values.dpi) + L"\r\nPinned=" + (values.pinned ? L"1" : L"0") + L"\r\n";
+    if (!values.monitor.empty() && values.workOrigin) {
+        contents += L"Monitor=" + values.monitor + L"\r\nWorkOrigin=" +
+            std::to_wstring(values.workOrigin->x) + L"," + std::to_wstring(values.workOrigin->y) + L"\r\n";
+    }
     int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, contents.data(), static_cast<int>(contents.size()),
         nullptr, 0, nullptr, nullptr);
     if (!length) return false;

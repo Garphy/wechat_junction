@@ -13,28 +13,38 @@ public:
     ~ListRowSizing() { if (sizing_) ImageList_Destroy(sizing_); }
 
     bool HasPlaceholder() const { return sizing_ != nullptr; }
+    int IconSize() const { return iconSize_; }
     int IconOffset() const { return iconOffset_; }
 
-    void Update(HWND list, HIMAGELIST fileImages, int padding) {
+    void Update(HWND list, HIMAGELIST fileImages, int iconSize, int padding, int iconGap) {
         int width = 0, height = 0;
         if (!fileImages || !ImageList_GetIconSize(fileImages, &width, &height)) return;
 
-        ListView_SetImageList(list, fileImages, LVSIL_SMALL);
+        HIMAGELIST baseline = nullptr;
+        if (width != iconSize || height != iconSize) {
+            baseline = Create(iconSize, iconSize);
+            if (!baseline) return;
+        }
+        ListView_SetImageList(list, baseline ? baseline : fileImages, LVSIL_SMALL);
         int baseRowHeight = RowHeight(list);
         int targetRowHeight = baseRowHeight + padding;
-        int sizingHeight = std::max(height, baseRowHeight) + padding;
-        auto sizing = Create(width, sizingHeight);
+        int sizingHeight = std::max(iconSize, baseRowHeight) + padding;
+        int sizingWidth = iconSize + iconGap;
+        auto sizing = Create(sizingWidth, sizingHeight);
         if (!sizing) {
             ListView_SetImageList(list, sizing_ ? sizing_ : fileImages, LVSIL_SMALL);
+            if (baseline) ImageList_Destroy(baseline);
+            if (!sizing_) iconSize_ = width;
             return;
         }
 
         ListView_SetImageList(list, sizing, LVSIL_SMALL);
+        if (baseline) ImageList_Destroy(baseline);
         // The font can set a higher floor than the icon, and list themes can add their own padding.
         int actualRowHeight = RowHeight(list);
         int correctedHeight = sizingHeight + targetRowHeight - actualRowHeight;
-        if (baseRowHeight > 0 && actualRowHeight > 0 && correctedHeight >= height && correctedHeight != sizingHeight) {
-            if (auto corrected = Create(width, correctedHeight)) {
+        if (baseRowHeight > 0 && actualRowHeight > 0 && correctedHeight >= iconSize && correctedHeight != sizingHeight) {
+            if (auto corrected = Create(sizingWidth, correctedHeight)) {
                 ListView_SetImageList(list, corrected, LVSIL_SMALL);
                 ImageList_Destroy(sizing);
                 sizing = corrected;
@@ -43,7 +53,8 @@ public:
         }
         if (sizing_) ImageList_Destroy(sizing_);
         sizing_ = sizing;
-        iconOffset_ = (sizingHeight - height) / 2;
+        iconSize_ = iconSize;
+        iconOffset_ = (sizingHeight - iconSize) / 2;
     }
 
 private:
@@ -62,5 +73,6 @@ private:
     }
 
     HIMAGELIST sizing_ = nullptr;
+    int iconSize_ = 0;
     int iconOffset_ = 0;
 };

@@ -2,6 +2,7 @@
 #include "folder.h"
 #include "list_row_sizing.h"
 #include "panel_canvas.h"
+#include "panel_placement.h"
 #include "resource.h"
 #include "selection_style.h"
 #include "settings.h"
@@ -25,6 +26,7 @@ constexpr UINT showMessage = WM_APP + 4;
 constexpr UINT chooseMessage = WM_APP + 5;
 constexpr UINT paintMessage = WM_APP + 6;
 constexpr UINT_PTR monthTimer = 2;
+constexpr UINT_PTR placementTimer = 3;
 constexpr int pinId = 200, chooseId = 201, listId = 202, closeId = 203;
 void DrawPill(HDC dc, const RECT& area, int radius, COLORREF fill) {
     auto brush = SelectObject(dc, GetStockObject(DC_BRUSH));
@@ -46,17 +48,43 @@ void DrawDesktopLabel(HDC dc, const wchar_t* text, RECT area, COLORREF color, UI
     DrawTextW(dc, text, -1, &area, flags);
 }
 
-RECT FitToScreen(RECT bounds) {
-    HMONITOR monitor = MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO info{};
+bool ReadMonitor(HMONITOR monitor, MONITORINFOEXW& info) {
     info.cbSize = sizeof(info);
-    if (!GetMonitorInfoW(monitor, &info)) return bounds;
-    auto work = info.rcWork;
-    auto width = std::min(bounds.right - bounds.left, work.right - work.left);
-    auto height = std::min(bounds.bottom - bounds.top, work.bottom - work.top);
-    auto x = std::clamp(bounds.left, work.left, work.right - width);
-    auto y = std::clamp(bounds.top, work.top, work.bottom - height);
-    return {x, y, x + width, y + height};
+    return monitor && GetMonitorInfoW(monitor, &info) && !IsRectEmpty(&info.rcWork);
+}
+
+const wchar_t* MonitorIdentity(const MONITORINFOEXW& info, DISPLAY_DEVICEW& device) {
+    device.cb = sizeof(device);
+    if (EnumDisplayDevicesW(info.szDevice, 0, &device, EDD_GET_DEVICE_INTERFACE_NAME) && device.DeviceID[0]) {
+        return device.DeviceID;
+    }
+    return info.szDevice;
+}
+
+HMONITOR FindMonitor(const settings::Values& settings) {
+    if (settings.monitor.empty()) return MonitorFromRect(&settings.bounds, MONITOR_DEFAULTTONULL);
+    struct Search {
+        const wchar_t* identity;
+        HMONITOR found = nullptr;
+    } search{settings.monitor.c_str()};
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+        auto& search = *reinterpret_cast<Search*>(data);
+        MONITORINFOEXW info{};
+        if (!ReadMonitor(monitor, info)) return TRUE;
+        DISPLAY_DEVICEW device{};
+        if (CompareStringOrdinal(search.identity, -1, MonitorIdentity(info, device), -1, TRUE) != CSTR_EQUAL) {
+            return TRUE;
+        }
+        search.found = monitor;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+void RememberMonitor(settings::Values& settings, const MONITORINFOEXW& info) {
+    DISPLAY_DEVICEW device{};
+    settings.monitor = MonitorIdentity(info, device);
+    settings.workOrigin = POINT{info.rcWork.left, info.rcWork.top};
 }
 
 RECT DefaultBounds() {
@@ -66,8 +94,19 @@ RECT DefaultBounds() {
     int offset = MulDiv(24, dpi, 96);
     auto x = work.right - offset;
     auto y = work.top + offset;
-    return FitToScreen({x - MulDiv(470, dpi, 96), y, x, y + MulDiv(460, dpi, 96)});
+    RECT bounds{x - MulDiv(470, dpi, 96), y, x, y + MulDiv(460, dpi, 96)};
+    return IsRectEmpty(&work) ? bounds : placement::Fit(bounds, work);
 }
+
+struct FileIcon {
+    int index = 0;
+    HICON scaledSource = nullptr;
+
+    FileIcon() = default;
+    FileIcon(const FileIcon&) = delete;
+    FileIcon& operator=(const FileIcon&) = delete;
+    ~FileIcon() { if (scaledSource) DestroyIcon(scaledSource); }
+};
 
 class Panel {
 public:
@@ -90,6 +129,7 @@ private:
     bool CreateControls();
     int Dip(int value) const { return MulDiv(value, dpi_, 96); }
     int HeaderHeight() const { return Dip(32); }
+    int FileIconSize() const { return Dip(16); }
     LRESULT HitTest(POINT point) const;
     void PaintFrame();
     void RequestPaint();
@@ -102,8 +142,11 @@ private:
     void FitColumn();
     void UpdateFont();
     void UpdateRowSpacing();
+    void UpdateDpi(UINT dpi);
     void Place(RECT bounds);
-    void FitCurrent();
+    bool RestorePlacement();
+    void SchedulePlacement();
+    void RememberPlacement();
     void Save(bool report = false);
     void AddTray();
     void TrayMenu();
@@ -114,7 +157,7 @@ private:
     void SetListCount();
     void FillDisplayInfo(NMLVDISPINFOW& info);
     void DrawRow(HDC dc, int row);
-    int Icon(const folder::Entry& entry);
+    FileIcon& Icon(const folder::Entry& entry);
     std::vector<std::wstring> Selected(std::vector<size_t>* readOnly = nullptr) const;
     void Context(int row, POINT point);
     void KeyboardContext();
@@ -140,6 +183,7 @@ private:
     HICON icon_ = nullptr;
     HICON trayIcon_ = nullptr;
     HIMAGELIST fileImages_ = nullptr;
+    int fileImageWidth_ = 0, fileImageHeight_ = 0;
     ListRowSizing rowSizing_;
     COLORREF textColor_ = RGB(255, 255, 255);
     PanelCanvas canvas_;
@@ -150,13 +194,16 @@ private:
     SIZE layoutSize_{};
     HWND hoveredButton_ = nullptr;
     bool trayAdded_ = false, busy_ = false, revealed_ = false, paintPending_ = false;
+    bool moving_ = false, placing_ = false;
+    RECT moveStart_{};
+    int placementRetries_ = 0;
     unsigned generation_ = 0;
     std::wstring path_;
     folder::Snapshot snapshot_;
     std::unique_ptr<folder::Monitor> monitor_;
     std::unique_ptr<DesktopLayer> desktop_;
     std::unique_ptr<shell::Actions> actions_;
-    std::unordered_map<std::wstring, int> icons_;
+    std::unordered_map<std::wstring, FileIcon> icons_;
 };
 
 bool Panel::Create() {
@@ -170,7 +217,15 @@ bool Panel::Create() {
     wc.lpfnWndProc = Proc;
     wc.lpszClassName = windowClass;
     if (!RegisterClassW(&wc)) return false;
-    auto bounds = IsRectEmpty(&settings_.bounds) ? DefaultBounds() : FitToScreen(settings_.bounds);
+    RECT bounds = DefaultBounds();
+    if (!IsRectEmpty(&settings_.bounds)) {
+        auto monitor = FindMonitor(settings_);
+        MONITORINFOEXW info{};
+        if (!ReadMonitor(monitor, info)) {
+            ReadMonitor(MonitorFromRect(&settings_.bounds, MONITOR_DEFAULTTONEAREST), info);
+        }
+        if (!IsRectEmpty(&info.rcWork)) bounds = placement::Fit(settings_.bounds, info.rcWork);
+    }
     return CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, windowClass, appName,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
         bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
@@ -183,13 +238,7 @@ void Panel::Start() {
     monitor_ = std::make_unique<folder::Monitor>(window_);
     desktop_ = std::make_unique<DesktopLayer>(window_);
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
-    dpi_ = GetDpiForWindow(window_);
-    if (!IsRectEmpty(&settings_.bounds) && settings_.dpi != dpi_) {
-        RECT bounds = settings_.bounds;
-        bounds.right = bounds.left + MulDiv(bounds.right - bounds.left, dpi_, settings_.dpi);
-        bounds.bottom = bounds.top + MulDiv(bounds.bottom - bounds.top, dpi_, settings_.dpi);
-        Place(FitToScreen(bounds));
-    }
+    if (IsRectEmpty(&settings_.bounds)) RememberPlacement();
     AddTray();
     RefreshSource();
     Show(false);
@@ -211,7 +260,10 @@ bool Panel::CreateControls() {
     ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     SendMessageW(list_, CCM_SETUNICODEFORMAT, TRUE, 0);
     shell::SmallIcon(L"file", FILE_ATTRIBUTE_NORMAL, &fileImages_);
-    if (fileImages_) ListView_SetImageList(list_, fileImages_, LVSIL_SMALL);
+    if (fileImages_) {
+        ImageList_GetIconSize(fileImages_, &fileImageWidth_, &fileImageHeight_);
+        ListView_SetImageList(list_, fileImages_, LVSIL_SMALL);
+    }
     LVCOLUMNW column{};
     column.mask = LVCF_WIDTH;
     ListView_InsertColumn(list_, 0, &column);
@@ -252,9 +304,7 @@ void Panel::UpdateFont() {
         iconFont_ = font;
     }
     LOGFONTW label{};
-    if (!SystemParametersInfoW(SPI_GETICONTITLELOGFONT, sizeof(label), &label, 0)) return;
-    label.lfHeight = MulDiv(label.lfHeight, dpi_, GetDpiForSystem());
-    label.lfWidth = MulDiv(label.lfWidth, dpi_, GetDpiForSystem());
+    if (!SystemParametersInfoForDpi(SPI_GETICONTITLELOGFONT, sizeof(label), &label, 0, dpi_)) return;
     // Solid glyph pixels keep the desktop color key out of the text edges.
     label.lfQuality = NONANTIALIASED_QUALITY;
     HFONT font = CreateFontIndirectW(&label);
@@ -267,7 +317,7 @@ void Panel::UpdateFont() {
 }
 
 void Panel::UpdateRowSpacing() {
-    rowSizing_.Update(list_, fileImages_, Dip(6));
+    rowSizing_.Update(list_, fileImages_, FileIconSize(), Dip(6), Dip(6));
 }
 
 void Panel::UpdateAppearance() {
@@ -423,23 +473,66 @@ void Panel::FitColumn() {
 }
 
 void Panel::Place(RECT bounds) {
+    RECT current{};
+    if (GetWindowRect(window_, &current) && EqualRect(&current, &bounds)) return;
+    placing_ = true;
     SetWindowPos(window_, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
         bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    placing_ = false;
 }
 
-void Panel::FitCurrent() {
-    if (IsIconic(window_)) return;
+void Panel::UpdateDpi(UINT dpi) {
+    if (!dpi || dpi_ == dpi) return;
+    dpi_ = dpi;
+    if (!list_) return;
+    selectionStyle_.Reset();
+    UpdateFont();
+    UpdateRowSpacing();
+    Layout();
+}
+
+bool Panel::RestorePlacement() {
+    if (moving_ || placing_ || IsIconic(window_) || IsRectEmpty(&settings_.bounds)) return true;
+    auto target = FindMonitor(settings_);
+    bool preferredAvailable = target != nullptr;
+    if (!target) target = MonitorFromRect(&settings_.bounds, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW info{};
+    if (!ReadMonitor(target, info)) return false;
+    if (preferredAvailable && settings_.monitor.empty()) {
+        RememberMonitor(settings_, info);
+        Save();
+    }
+
+    // Move onto the target before asking for its effective per-window DPI.
+    if (MonitorFromWindow(window_, MONITOR_DEFAULTTONULL) != target) {
+        Place(placement::Fit(settings_.bounds, info.rcWork));
+    }
+    if (MonitorFromWindow(window_, MONITOR_DEFAULTTONULL) != target) return false;
+    UpdateDpi(GetDpiForWindow(window_));
+    auto origin = settings_.workOrigin.value_or(POINT{info.rcWork.left, info.rcWork.top});
+    Place(placement::ScaleToWorkArea(settings_.bounds, origin, settings_.dpi, info.rcWork, dpi_));
+    return preferredAvailable;
+}
+
+void Panel::SchedulePlacement() {
+    placementRetries_ = 2;
+    SetTimer(window_, placementTimer, 300, nullptr);
+}
+
+void Panel::RememberPlacement() {
     RECT bounds{};
     if (!GetWindowRect(window_, &bounds)) return;
-    auto fitted = FitToScreen(bounds);
-    if (!EqualRect(&bounds, &fitted)) Place(fitted);
+    MONITORINFOEXW info{};
+    if (!ReadMonitor(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), info)) return;
+    bounds = placement::Fit(bounds, info.rcWork);
+    Place(bounds);
+    UpdateDpi(GetDpiForWindow(window_));
+    settings_.bounds = bounds;
+    settings_.dpi = dpi_;
+    RememberMonitor(settings_, info);
 }
 
 void Panel::Save(bool report) {
-    if (!IsIconic(window_)) {
-        GetWindowRect(window_, &settings_.bounds);
-        settings_.dpi = dpi_;
-    }
     if (!settings::Write(settingsPath_, settings_) && report) {
         MessageBoxW(window_, L"无法写入 EXE 同目录的 DesktopJunction.ini。请确认目录可写。",
             appName, MB_OK | MB_ICONWARNING);
@@ -490,8 +583,8 @@ void Panel::TrayMenu() {
 }
 
 void Panel::Show(bool activate) {
-    FitCurrent();
     ShowWindow(window_, SW_SHOWNOACTIVATE);
+    if (!RestorePlacement()) SchedulePlacement();
     RequestPaint();
     if (activate) {
         SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
@@ -574,7 +667,7 @@ void Panel::SetListCount() {
     FitColumn();
 }
 
-int Panel::Icon(const folder::Entry& entry) {
+FileIcon& Panel::Icon(const folder::Entry& entry) {
     bool directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     auto dot = entry.name.find_last_of(L'.');
     auto extension = directory ? L"*" : dot == std::wstring::npos ? L"" : entry.name.substr(dot);
@@ -582,7 +675,7 @@ int Panel::Icon(const folder::Entry& entry) {
     if (found != icons_.end()) return found->second;
     if (icons_.size() >= 256 && !directory) extension.clear();
     auto [item, inserted] = icons_.try_emplace(extension);
-    if (inserted) item->second = shell::SmallIcon((L"file" + extension).c_str(),
+    if (inserted) item->second.index = shell::SmallIcon((L"file" + extension).c_str(),
         directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL);
     return item->second;
 }
@@ -591,7 +684,7 @@ void Panel::FillDisplayInfo(NMLVDISPINFOW& info) {
     LVITEMW& item = info.item;
     if (item.iItem < 0 || size_t(item.iItem) >= snapshot_.entries.size()) return;
     const auto& entry = snapshot_.entries[item.iItem];
-    if (item.mask & LVIF_IMAGE) item.iImage = rowSizing_.HasPlaceholder() ? 0 : Icon(entry);
+    if (item.mask & LVIF_IMAGE) item.iImage = rowSizing_.HasPlaceholder() ? 0 : Icon(entry).index;
     if ((item.mask & LVIF_TEXT) && item.pszText && item.cchTextMax > 0) {
         lstrcpynW(item.pszText, entry.name.c_str(), item.cchTextMax);
     }
@@ -607,11 +700,18 @@ void Panel::DrawRow(HDC dc, int row) {
     auto images = fileImages_;
     if (images) {
         icon.top += rowSizing_.IconOffset();
-        ImageList_Draw(images, Icon(entry), dc, icon.left, icon.top, ILD_TRANSPARENT);
-        if (folder::IsReadOnlyFile(entry.attributes)) {
-            int width = 0, height = 0;
-            ImageList_GetIconSize(images, &width, &height);
-            LONG x = icon.left + width - Dip(10), y = icon.top + height - Dip(11);
+        int size = rowSizing_.HasPlaceholder() ? rowSizing_.IconSize() : fileImageWidth_;
+        auto& fileIcon = Icon(entry);
+        bool drawn;
+        if (size == fileImageWidth_ && size == fileImageHeight_) {
+            drawn = ImageList_Draw(images, fileIcon.index, dc, icon.left, icon.top, ILD_TRANSPARENT) != FALSE;
+        } else {
+            if (!fileIcon.scaledSource) fileIcon.scaledSource = ImageList_GetIcon(images, fileIcon.index, ILD_TRANSPARENT);
+            drawn = fileIcon.scaledSource &&
+                DrawIconEx(dc, icon.left, icon.top, fileIcon.scaledSource, size, size, 0, nullptr, DI_NORMAL);
+        }
+        if (drawn && folder::IsReadOnlyFile(entry.attributes)) {
+            LONG x = icon.left + size - Dip(10), y = icon.top + size - Dip(11);
             auto pen = SelectObject(dc, GetStockObject(DC_PEN));
             auto brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             SetDCPenColor(dc, RGB(31, 37, 44));
@@ -824,15 +924,14 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam == SIZE_MINIMIZED) PostMessageW(window_, DesktopLayer::changed, TRUE, 0);
         return 0;
     case WM_DPICHANGED:
-        dpi_ = HIWORD(wParam);
-        selectionStyle_.Reset();
-        UpdateFont();
-        UpdateRowSpacing();
-        Place(FitToScreen(*reinterpret_cast<RECT*>(lParam)));
-        Layout();
+        UpdateDpi(HIWORD(wParam));
+        if (!placing_) {
+            if (moving_) Place(*reinterpret_cast<const RECT*>(lParam));
+            else SchedulePlacement();
+        }
         return 0;
     case WM_DISPLAYCHANGE:
-        FitCurrent();
+        SchedulePlacement();
         return 0;
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETICONTITLELOGFONT) {
@@ -842,7 +941,7 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (!wParam || wParam == SPI_SETDESKWALLPAPER || wParam == SPI_SETHIGHCONTRAST) UpdateAppearance();
         if (wParam == SPI_SETHIGHCONTRAST) RefreshSelectionStyle();
-        if (wParam == SPI_SETWORKAREA) FitCurrent();
+        if (wParam == SPI_SETWORKAREA) SchedulePlacement();
         if (lParam && !wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"intl")) RefreshSource();
         break;
     case WM_SYSCOLORCHANGE:
@@ -850,10 +949,17 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         UpdateAppearance();
         RefreshSelectionStyle();
         break;
-    case WM_EXITSIZEMOVE:
-        FitCurrent();
-        Save();
+    case WM_ENTERSIZEMOVE:
+        moving_ = GetWindowRect(window_, &moveStart_) != FALSE;
         return 0;
+    case WM_EXITSIZEMOVE: {
+        RECT bounds{};
+        if (std::exchange(moving_, false) && GetWindowRect(window_, &bounds) && !EqualRect(&moveStart_, &bounds)) {
+            RememberPlacement();
+            Save();
+        }
+        return 0;
+    }
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) revealed_ = false;
         RequestPaint();
@@ -871,13 +977,22 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (IsWindowVisible(window_) && !revealed_) desktop_->Update(settings_.pinned);
         } else if (wParam == monthTimer) {
             RefreshSource();
+        } else if (wParam == placementTimer) {
+            KillTimer(window_, placementTimer);
+            if (!RestorePlacement() && placementRetries_ > 0) {
+                --placementRetries_;
+                SetTimer(window_, placementTimer, 2000, nullptr);
+            }
         }
         return 0;
     case WM_TIMECHANGE:
         RefreshSource();
         return 0;
     case WM_POWERBROADCAST:
-        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) RefreshSource();
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            SchedulePlacement();
+            RefreshSource();
+        }
         return TRUE;
     case folder::Monitor::ready:
         ApplyPending();

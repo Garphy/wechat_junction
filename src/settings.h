@@ -2,12 +2,16 @@
 
 #include "folder.h"
 
+#include <optional>
+
 namespace settings {
 
 struct Values {
     folder::Source source;
     RECT bounds{};
     UINT dpi = USER_DEFAULT_SCREEN_DPI;
+    std::wstring monitor;
+    std::optional<POINT> workOrigin;
     bool pinned = false;
 };
 

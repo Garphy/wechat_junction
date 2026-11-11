@@ -1,6 +1,7 @@
 #include "../src/folder.h"
 #include "../src/list_row_sizing.h"
 #include "../src/panel_canvas.h"
+#include "../src/panel_placement.h"
 #include "../src/selection_style.h"
 #include "../src/settings.h"
 #include "../src/shell.h"
@@ -206,7 +207,9 @@ void TestRowSizing() {
     Check(ListView_InsertColumn(list, 0, &column) >= 0, "create native list column");
 
     ListRowSizing sizing;
-    for (UINT dpi : {96u, 144u, 192u}) {
+    auto shellImages = ImageList_Create(16, 16, ILC_COLOR32, 1, 0);
+    Check(shellImages != nullptr, "create shell-sized image list");
+    for (UINT dpi : {96u, 120u, 144u, 192u, 216u}) {
         int iconSize = MulDiv(16, dpi, 96);
         auto images = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 0);
         Check(images != nullptr && ImageList_SetImageCount(images, 1), "create base image list");
@@ -216,15 +219,63 @@ void TestRowSizing() {
         Check(ListView_GetItemRect(list, 0, &before, LVIR_BOUNDS), "measure unpadded row");
         ListView_SetItemCount(list, 0);
         int padding = MulDiv(6, dpi, 96);
-        sizing.Update(list, images, padding);
+        int iconGap = MulDiv(6, dpi, 96);
+        sizing.Update(list, shellImages, iconSize, padding, iconGap);
         ListView_SetItemCount(list, 4);
         Check(ListView_GetItemRect(list, 0, &after, LVIR_BOUNDS) &&
-            (after.bottom - after.top) - (before.bottom - before.top) == padding,
+            (after.bottom - after.top) - (before.bottom - before.top) == padding && sizing.IconSize() == iconSize,
             "native row height increases by six logical pixels");
+        RECT icon{}, label{};
+        Check(ListView_GetItemRect(list, 0, &icon, LVIR_ICON) &&
+            ListView_GetItemRect(list, 0, &label, LVIR_LABEL) && label.left - icon.left - sizing.IconSize() >= iconGap,
+            "native label leaves six logical pixels after the drawn icon");
         ListView_SetImageList(list, nullptr, LVSIL_SMALL);
         ImageList_Destroy(images);
     }
     DestroyWindow(list);
+    ImageList_Destroy(shellImages);
+}
+
+void TestIconScaling() {
+    constexpr COLORREF color = RGB(21, 74, 180);
+    std::uint32_t pixels[16 * 16];
+    std::fill_n(pixels, 16 * 16, 0xff154ab4);
+    auto bitmap = CreateBitmap(16, 16, 1, 32, pixels);
+    auto images = ImageList_Create(16, 16, ILC_COLOR32, 1, 0);
+    Check(bitmap && images && ImageList_Add(images, bitmap, nullptr) == 0, "create scaled icon fixture");
+    DeleteObject(bitmap);
+    auto icon = ImageList_GetIcon(images, 0, ILD_TRANSPARENT);
+    ImageList_Destroy(images);
+    Check(icon != nullptr, "extract icon from a fixed-size image list");
+    PanelCanvas canvas;
+    for (int size : {20, 36}) {
+        HDC dc = canvas.Prepare(48, 48);
+        Check(dc && DrawIconEx(dc, 1, 2, icon, size, size, 0, nullptr, DI_NORMAL), "draw an icon at the panel DPI");
+        Check(GetPixel(dc, size, size + 1) == color && GetPixel(dc, size + 1, size + 1) != color,
+            "icon fills exactly the requested DPI-scaled area");
+    }
+    DestroyIcon(icon);
+}
+
+void TestPlacement() {
+    RECT primary{0, 0, 3072, 1820};
+    RECT secondary{3072, 0, 5632, 1390};
+    RECT saved{1980, 108, 3015, 1143};
+    POINT origin{primary.left, primary.top};
+    auto fallback = placement::ScaleToWorkArea(saved, origin, 216, secondary, 120);
+    RECT expectedFallback{4172, 60, 4747, 635};
+    Check(EqualRect(&fallback, &expectedFallback), "missing 225 percent monitor falls back at 125 percent DPI");
+    auto restored = placement::ScaleToWorkArea(saved, origin, 216, primary, 216);
+    Check(EqualRect(&restored, &saved), "returning monitor restores the original size and position");
+
+    RECT relocated{-3072, 60, 0, 1880};
+    RECT expectedRelocated{-1092, 168, -57, 1203};
+    auto moved = placement::ScaleToWorkArea(saved, origin, 216, relocated, 216);
+    Check(EqualRect(&moved, &expectedRelocated), "monitor origin changes preserve the relative panel position");
+
+    RECT smaller{0, 0, 800, 600};
+    auto fitted = placement::ScaleToWorkArea(saved, origin, 216, smaller, 216);
+    Check(EqualRect(&fitted, &smaller), "reduced work area keeps the panel on screen");
 }
 
 void TestSettings(const std::filesystem::path& root) {
@@ -239,14 +290,18 @@ void TestSettings(const std::filesystem::path& root) {
     auto loaded = settings::Load(ini.wstring(), imported);
     Check(!imported && loaded.source.path == original.source.path && loaded.source.monthly,
         "INI takes precedence and preserves the Unicode path and mapping mode");
-    Check(EqualRect(&loaded.bounds, &original.bounds) && loaded.dpi == 144 && loaded.pinned,
-        "INI preserves negative monitor coordinates, DPI and pin");
+    Check(EqualRect(&loaded.bounds, &original.bounds) && loaded.dpi == 144 && loaded.pinned &&
+        loaded.monitor.empty() && !loaded.workOrigin, "legacy INI preserves bounds, DPI and pin");
 
     original.source.monthly = false;
     original.pinned = false;
+    original.monitor = LR"(\\?\DISPLAY#MonitorA#PortA)";
+    original.workOrigin = POINT{-2560, 48};
     Check(settings::Write(ini.wstring(), original), "replace existing INI");
     loaded = settings::Load(ini.wstring(), imported);
     Check(!loaded.source.monthly && !loaded.pinned, "INI reloads changed options");
+    Check(loaded.monitor == original.monitor && loaded.workOrigin && loaded.workOrigin->x == -2560 &&
+        loaded.workOrigin->y == 48, "INI preserves the monitor identity and its signed work area origin");
     Check(!std::filesystem::exists(ini.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp"),
         "save leaves no temporary file");
     Check(!settings::Write((root / L"missing" / ini.filename()).wstring(), original),
@@ -413,6 +468,8 @@ int main() {
         TestResources(fixture.path);
         TestSelectionCompositing();
         TestRowSizing();
+        TestIconScaling();
+        TestPlacement();
         TestSettings(fixture.path);
         TestStartupRegistration();
         TestNativeDesktopCopies(fixture.path);

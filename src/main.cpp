@@ -1,9 +1,12 @@
 #include "desktop.h"
 #include "folder.h"
+#include "list_row_sizing.h"
 #include "panel_canvas.h"
 #include "resource.h"
+#include "selection_style.h"
 #include "settings.h"
 #include "shell.h"
+#include "startup.h"
 
 #include <windowsx.h>
 #include <oleacc.h>
@@ -94,9 +97,11 @@ private:
     void DrawRows(HDC dc);
     void DrawScrollbar(HDC dc);
     void UpdateAppearance();
+    void RefreshSelectionStyle();
     void Layout();
     void FitColumn();
     void UpdateFont();
+    void UpdateRowSpacing();
     void Place(RECT bounds);
     void FitCurrent();
     void Save(bool report = false);
@@ -110,7 +115,7 @@ private:
     void FillDisplayInfo(NMLVDISPINFOW& info);
     void DrawRow(HDC dc, int row);
     int Icon(const folder::Entry& entry);
-    std::vector<std::wstring> Selected() const;
+    std::vector<std::wstring> Selected(std::vector<size_t>* readOnly = nullptr) const;
     void Context(int row, POINT point);
     void KeyboardContext();
     bool Key(WPARAM key);
@@ -134,8 +139,14 @@ private:
     HFONT font_ = nullptr, iconFont_ = nullptr;
     HICON icon_ = nullptr;
     HICON trayIcon_ = nullptr;
+    HIMAGELIST fileImages_ = nullptr;
+    ListRowSizing rowSizing_;
     COLORREF textColor_ = RGB(255, 255, 255);
     PanelCanvas canvas_;
+    SelectionStyle selectionStyle_;
+    std::vector<RECT> selectedRows_;
+    RECT selectionViewport_{};
+    bool highContrast_ = false;
     SIZE layoutSize_{};
     HWND hoveredButton_ = nullptr;
     bool trayAdded_ = false, busy_ = false, revealed_ = false, paintPending_ = false;
@@ -199,9 +210,8 @@ bool Panel::CreateControls() {
     if (!choose_ || !pin_ || !close_ || !list_) return false;
     ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     SendMessageW(list_, CCM_SETUNICODEFORMAT, TRUE, 0);
-    HIMAGELIST images = nullptr;
-    shell::SmallIcon(L"file", FILE_ATTRIBUTE_NORMAL, &images);
-    if (images) ListView_SetImageList(list_, images, LVSIL_SMALL);
+    shell::SmallIcon(L"file", FILE_ATTRIBUTE_NORMAL, &fileImages_);
+    if (fileImages_) ListView_SetImageList(list_, fileImages_, LVSIL_SMALL);
     LVCOLUMNW column{};
     column.mask = LVCF_WIDTH;
     ListView_InsertColumn(list_, 0, &column);
@@ -226,6 +236,8 @@ bool Panel::CreateControls() {
     SendMessageW(pin_, BM_SETCHECK, settings_.pinned ? BST_CHECKED : BST_UNCHECKED, 0);
     dpi_ = GetDpiForWindow(window_);
     UpdateFont();
+    UpdateRowSpacing();
+    RefreshSelectionStyle();
     Layout();
     return true;
 }
@@ -254,9 +266,21 @@ void Panel::UpdateFont() {
     font_ = font;
 }
 
+void Panel::UpdateRowSpacing() {
+    rowSizing_.Update(list_, fileImages_, Dip(6));
+}
+
 void Panel::UpdateAppearance() {
     COLORREF color = DesktopLayer::TextColor();
     if (std::exchange(textColor_, color) != color) RequestPaint();
+}
+
+void Panel::RefreshSelectionStyle() {
+    HIGHCONTRASTW contrast{sizeof(contrast), 0, nullptr};
+    highContrast_ = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    selectionStyle_.Reset();
+    RequestPaint();
 }
 
 LRESULT Panel::HitTest(POINT point) const {
@@ -285,8 +309,16 @@ void Panel::PaintFrame() {
     if (!dc) return;
     FrameRect(dc, &area, GetSysColorBrush(COLOR_3DSHADOW));
     DrawToolbar(dc, area);
+    selectedRows_.clear();
     DrawRows(dc);
     DrawScrollbar(dc);
+    canvas_.NormalizeAlpha();
+    bool focused = GetFocus() == list_ && GetForegroundWindow() == window_;
+    for (const auto& row : selectedRows_) {
+        auto pixels = selectionStyle_.Pixels(list_, row.right - row.left, row.bottom - row.top,
+            dpi_, focused, highContrast_);
+        canvas_.CompositeBackground(row, selectionViewport_, pixels);
+    }
     canvas_.Present(window_);
 }
 
@@ -336,6 +368,8 @@ void Panel::DrawRows(HDC dc) {
     GetClientRect(list_, &client);
     POINT origin{};
     MapWindowPoints(list_, window_, &origin, 1);
+    selectionViewport_ = client;
+    OffsetRect(&selectionViewport_, origin.x, origin.y);
     int saved = SaveDC(dc);
     if (!saved) return;
     SetViewportOrgEx(dc, origin.x, origin.y, nullptr);
@@ -428,18 +462,31 @@ void Panel::TrayMenu() {
     if (busy_) return;
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuW(menu, MF_STRING, 1, L"显示面板");
-    AppendMenuW(menu, MF_STRING, 2, L"设置目录…");
-    AppendMenuW(menu, MF_STRING, 3, L"退出");
+    constexpr UINT show = 1, choose = 2, exit = 3, autoStartCommand = 4;
+    auto executable = settings::ExecutablePath();
+    auto autoStart = startup::IsEnabled(executable);
+    AppendMenuW(menu, MF_STRING, show, L"显示面板");
+    AppendMenuW(menu, MF_STRING, choose, L"设置目录…");
+    AppendMenuW(menu, MF_STRING | (!autoStart ? MF_GRAYED : *autoStart ? MF_CHECKED : MF_UNCHECKED),
+        autoStartCommand, L"开机自启");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, exit, L"退出");
     POINT point{};
     GetCursorPos(&point);
     SetForegroundWindow(window_);
     UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, window_, nullptr);
     PostMessageW(window_, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    if (command == 1) Show(true);
-    if (command == 2) Choose();
-    if (command == 3) DestroyWindow(window_);
+    if (command == show) Show(true);
+    if (command == choose) Choose();
+    if (command == autoStartCommand && autoStart) {
+        auto status = startup::SetEnabled(executable, !*autoStart);
+        if (status != ERROR_SUCCESS) {
+            auto message = L"无法更新开机自启设置。Windows 错误 " + std::to_wstring(status);
+            MessageBoxW(window_, message.c_str(), appName, MB_OK | MB_ICONWARNING);
+        }
+    }
+    if (command == exit) DestroyWindow(window_);
 }
 
 void Panel::Show(bool activate) {
@@ -544,7 +591,7 @@ void Panel::FillDisplayInfo(NMLVDISPINFOW& info) {
     LVITEMW& item = info.item;
     if (item.iItem < 0 || size_t(item.iItem) >= snapshot_.entries.size()) return;
     const auto& entry = snapshot_.entries[item.iItem];
-    if (item.mask & LVIF_IMAGE) item.iImage = Icon(entry);
+    if (item.mask & LVIF_IMAGE) item.iImage = rowSizing_.HasPlaceholder() ? 0 : Icon(entry);
     if ((item.mask & LVIF_TEXT) && item.pszText && item.cchTextMax > 0) {
         lstrcpynW(item.pszText, entry.name.c_str(), item.cchTextMax);
     }
@@ -552,29 +599,55 @@ void Panel::FillDisplayInfo(NMLVDISPINFOW& info) {
 
 void Panel::DrawRow(HDC dc, int row) {
     const auto& entry = snapshot_.entries[row];
+    auto state = ListView_GetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED);
+    bool selected = (state & LVIS_SELECTED) != 0;
     RECT label{}, icon{};
     ListView_GetItemRect(list_, row, &label, LVIR_LABEL);
     ListView_GetItemRect(list_, row, &icon, LVIR_ICON);
-    auto images = ListView_GetImageList(list_, LVSIL_SMALL);
-    if (images) ImageList_Draw(images, Icon(entry), dc, icon.left, icon.top, ILD_TRANSPARENT);
+    auto images = fileImages_;
+    if (images) {
+        icon.top += rowSizing_.IconOffset();
+        ImageList_Draw(images, Icon(entry), dc, icon.left, icon.top, ILD_TRANSPARENT);
+        if (folder::IsReadOnlyFile(entry.attributes)) {
+            int width = 0, height = 0;
+            ImageList_GetIconSize(images, &width, &height);
+            LONG x = icon.left + width - Dip(10), y = icon.top + height - Dip(11);
+            auto pen = SelectObject(dc, GetStockObject(DC_PEN));
+            auto brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            SetDCPenColor(dc, RGB(31, 37, 44));
+            RoundRect(dc, x + Dip(2), y, x + Dip(8), y + Dip(8), Dip(4), Dip(4));
+            SetDCPenColor(dc, RGB(255, 228, 152));
+            RoundRect(dc, x + Dip(3), y + Dip(1), x + Dip(7), y + Dip(8), Dip(3), Dip(3));
+            SelectObject(dc, brush);
+            SelectObject(dc, pen);
+            DrawPill(dc, {x, y + Dip(4), x + Dip(10), y + Dip(11)}, Dip(3), RGB(31, 37, 44));
+            DrawPill(dc, {x + Dip(1), y + Dip(5), x + Dip(9), y + Dip(10)}, Dip(2), RGB(255, 228, 152));
+            SetPixelV(dc, x + Dip(5), y + Dip(7), RGB(31, 37, 44));
+        }
+    }
     HGDIOBJ old = font_ ? SelectObject(dc, font_) : nullptr;
-    DrawDesktopLabel(dc, entry.name.c_str(), label, textColor_,
+    DrawDesktopLabel(dc, entry.name.c_str(), label, selected && highContrast_ ? GetSysColor(COLOR_HIGHLIGHTTEXT) : textColor_,
         DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
     if (old) SelectObject(dc, old);
-    auto state = ListView_GetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED);
-    if ((state & LVIS_SELECTED) || (GetFocus() == list_ && (state & LVIS_FOCUSED))) {
-        RECT bounds{};
-        if (ListView_GetItemRect(list_, row, &bounds, LVIR_BOUNDS)) {
-            if (state & LVIS_SELECTED) FrameRect(dc, &bounds, GetSysColorBrush(COLOR_HIGHLIGHT));
-            else DrawFocusRect(dc, &bounds);
-        }
+    if (!selected && !(GetFocus() == list_ && (state & LVIS_FOCUSED))) return;
+    RECT bounds{};
+    if (!ListView_GetItemRect(list_, row, &bounds, LVIR_BOUNDS)) return;
+    if (selected) {
+        LONG gap = Dip(1);
+        selectedRows_.push_back({selectionViewport_.left + Dip(2), selectionViewport_.top + bounds.top + gap,
+            selectionViewport_.right - Dip(2), selectionViewport_.top + bounds.bottom - gap});
+    } else {
+        DrawFocusRect(dc, &bounds);
     }
 }
 
-std::vector<std::wstring> Panel::Selected() const {
+std::vector<std::wstring> Panel::Selected(std::vector<size_t>* readOnly) const {
     std::vector<std::wstring> names;
     for (int i = -1; (i = ListView_GetNextItem(list_, i, LVNI_SELECTED)) >= 0;) {
-        if (size_t(i) < snapshot_.entries.size()) names.push_back(snapshot_.entries[i].name);
+        if (size_t(i) >= snapshot_.entries.size()) continue;
+        const auto& entry = snapshot_.entries[i];
+        if (readOnly && folder::IsReadOnlyFile(entry.attributes)) readOnly->push_back(names.size());
+        names.push_back(entry.name);
     }
     return names;
 }
@@ -617,14 +690,15 @@ bool Panel::Key(WPARAM key) {
         return true;
     }
     if (key != VK_RETURN && key != VK_DELETE && key != VK_F2 && !(ctrl && (key == 'C' || key == 'X'))) return false;
-    auto names = Selected();
+    std::vector<size_t> readOnly;
+    auto names = Selected(key == 'C' ? &readOnly : nullptr);
     auto path = snapshot_.path;
     if (!names.empty()) Action([&] {
         switch (key) {
         case VK_RETURN: shell::Open(window_, folder::Join(path, names.front())); break;
         case VK_DELETE: actions_->Delete(path, names); break;
         case VK_F2: if (names.size() == 1) actions_->Rename(path, names.front()); break;
-        case 'C': actions_->Copy(path, names, false); break;
+        case 'C': actions_->Copy(path, names, false, readOnly); break;
         case 'X': actions_->Copy(path, names, true); break;
         }
     });
@@ -649,9 +723,10 @@ LRESULT Panel::Notify(const NMHDR& header) {
         Context(click.iItem, point);
         return TRUE;
     } else if (header.code == LVN_BEGINDRAG) {
-        auto names = Selected();
+        std::vector<size_t> readOnly;
+        auto names = Selected(&readOnly);
         auto path = snapshot_.path;
-        if (!names.empty()) Action([&] { actions_->Drag(path, names); });
+        if (!names.empty()) Action([&] { actions_->Drag(path, names, readOnly); });
     }
     return 0;
 }
@@ -734,7 +809,10 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_ERASEBKGND: return TRUE;
     case WM_SHOWWINDOW:
-        if (!wParam) canvas_.Reset();
+        if (!wParam) {
+            canvas_.Reset();
+            selectionStyle_.Reset();
+        }
         break;
     case WM_GETMINMAXINFO: {
         auto& limits = *reinterpret_cast<MINMAXINFO*>(lParam);
@@ -747,7 +825,9 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED:
         dpi_ = HIWORD(wParam);
+        selectionStyle_.Reset();
         UpdateFont();
+        UpdateRowSpacing();
         Place(FitToScreen(*reinterpret_cast<RECT*>(lParam)));
         Layout();
         return 0;
@@ -757,16 +837,18 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETICONTITLELOGFONT) {
             UpdateFont();
+            UpdateRowSpacing();
             Layout();
         }
         if (!wParam || wParam == SPI_SETDESKWALLPAPER || wParam == SPI_SETHIGHCONTRAST) UpdateAppearance();
+        if (wParam == SPI_SETHIGHCONTRAST) RefreshSelectionStyle();
         if (wParam == SPI_SETWORKAREA) FitCurrent();
         if (lParam && !wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"intl")) RefreshSource();
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
         UpdateAppearance();
-        RequestPaint();
+        RefreshSelectionStyle();
         break;
     case WM_EXITSIZEMOVE:
         FitCurrent();
@@ -774,6 +856,7 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) revealed_ = false;
+        RequestPaint();
         PostMessageW(window_, DesktopLayer::changed, 0, 0);
         break;
     case DesktopLayer::changed:
@@ -798,6 +881,9 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return TRUE;
     case folder::Monitor::ready:
         ApplyPending();
+        return 0;
+    case WM_CLIPBOARDUPDATE:
+        if (actions_) actions_->ClipboardChanged();
         return 0;
     case WM_NOTIFY:
         return Notify(*reinterpret_cast<const NMHDR*>(lParam));

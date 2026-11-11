@@ -12,6 +12,7 @@ struct Values {
 };
 
 std::wstring FilePath();
+std::wstring ExecutablePath();
 Values Load(const std::wstring& path, bool& imported);
 bool Write(const std::wstring& path, const Values& values);
 

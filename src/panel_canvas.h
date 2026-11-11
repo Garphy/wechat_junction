@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
 
 constexpr COLORREF canvasKey = RGB(2, 1, 2);
+constexpr std::uint32_t canvasBackground = 0x01000000;
 
 class PanelCanvas {
 public:
@@ -23,7 +25,7 @@ public:
         size_ = {};
     }
 
-    HDC Prepare(LONG width, LONG height) {
+    HDC Prepare(LONG width, LONG height, std::uint32_t background = canvasKey) {
         if (width <= 0 || height <= 0) return nullptr;
         if (!dc_) dc_ = CreateCompatibleDC(nullptr);
         if (!dc_) return nullptr;
@@ -48,17 +50,42 @@ public:
             size_ = {width, height};
         }
         GdiFlush();
-        std::fill_n(pixels_, PixelCount(), canvasKey);
+        std::fill_n(pixels_, PixelCount(), background);
         return dc_;
     }
 
-    void Present(HWND window) {
+    std::span<const std::uint32_t> Pixels() const {
+        GdiFlush();
+        return {pixels_, PixelCount()};
+    }
+
+    void NormalizeAlpha() {
         GdiFlush();
         for (size_t i = 0; i < PixelCount(); ++i) {
             auto color = pixels_[i] & 0x00FFFFFF;
             // Alpha zero is click-through. Alpha one is visually negligible and keeps the hit area.
-            pixels_[i] = color == canvasKey ? 0x01000000 : color | 0xFF000000;
+            pixels_[i] = color == canvasKey ? canvasBackground : color | 0xFF000000;
         }
+    }
+
+    void CompositeBackground(RECT area, RECT clip, std::span<const std::uint32_t> overlay) {
+        RECT bounds{0, 0, size_.cx, size_.cy};
+        RECT visible{};
+        if (!IntersectRect(&visible, &area, &clip) || !IntersectRect(&visible, &visible, &bounds)) return;
+        size_t width = area.right - area.left;
+        size_t height = area.bottom - area.top;
+        if (overlay.size() != width * height) return;
+        for (LONG y = visible.top; y < visible.bottom; ++y) {
+            auto* destination = pixels_ + size_t(y) * size_.cx;
+            const auto* source = overlay.data() + size_t(y - area.top) * width;
+            for (LONG x = visible.left; x < visible.right; ++x) {
+                auto color = source[x - area.left];
+                if (destination[x] == canvasBackground && (color >> 24) != 0) destination[x] = color;
+            }
+        }
+    }
+
+    void Present(HWND window) {
         POINT source{};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
         UpdateLayeredWindow(window, nullptr, nullptr, &size_, dc_, &source, 0, &blend, ULW_ALPHA);

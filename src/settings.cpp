@@ -110,11 +110,17 @@ Values ReadIni(const std::wstring& path) {
 }
 }
 
-std::wstring FilePath() {
+std::wstring ExecutablePath() {
     std::wstring exe(32768, L'\0');
     DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
     if (!length || length >= exe.size()) return {};
     exe.resize(length);
+    return exe;
+}
+
+std::wstring FilePath() {
+    auto exe = ExecutablePath();
+    if (exe.empty()) return {};
     return (std::filesystem::path(exe).parent_path() / L"DesktopJunction.ini").wstring();
 }
 

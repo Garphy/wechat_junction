@@ -1,10 +1,15 @@
 #include "../src/folder.h"
+#include "../src/list_row_sizing.h"
 #include "../src/panel_canvas.h"
+#include "../src/selection_style.h"
 #include "../src/settings.h"
+#include "../src/shell.h"
+#include "../src/startup.h"
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <system_error>
@@ -129,6 +134,12 @@ void TestResources(const std::filesystem::path& root) {
     HWND receiver = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
         GetModuleHandleW(nullptr), nullptr);
     Check(receiver != nullptr, "create resource test receiver");
+    // UxTheme initializes process-wide resources on its first use.
+    {
+        SelectionStyle warm;
+        warm.Pixels(receiver, 160, 28, 96, true, false);
+        warm.Pixels(receiver, 160, 28, 96, false, false);
+    }
     auto process = GetCurrentProcess();
     DWORD handlesBefore = 0;
     Check(GetProcessHandleCount(process, &handlesBefore), "read baseline handle count");
@@ -143,12 +154,77 @@ void TestResources(const std::filesystem::path& root) {
         }
         canvas.Reset();
         Check(canvas.Prepare(112, 64) != nullptr, "restore canvas after releasing it");
+        SelectionStyle selection;
+        for (UINT dpi : {96u, 144u, 192u}) {
+            Check(!selection.Pixels(receiver, 160, 28, dpi, true, false).empty(), "render focused selection");
+            Check(!selection.Pixels(receiver, 160, 28, dpi, false, false).empty(), "render inactive selection");
+            selection.Reset();
+        }
     }
     DWORD handlesAfter = 0;
     Check(GetProcessHandleCount(process, &handlesAfter) && handlesAfter == handlesBefore,
         "directory monitor released its handles");
     Check(GetGuiResources(process, GR_GDIOBJECTS) == gdiBefore, "canvas released its GDI objects");
     DestroyWindow(receiver);
+}
+
+void TestSelectionCompositing() {
+    SelectionStyle style;
+    constexpr LONG width = 32, height = 20;
+    constexpr size_t center = size_t(height / 2) * width + width / 2;
+    auto active = style.Pixels(nullptr, width, height, 96, true, false);
+    auto inactive = style.Pixels(nullptr, width, height, 96, false, false);
+    Check(active[0] == 0 && (active[center] >> 24) > (inactive[center] >> 24) &&
+        (active[center] >> 24) < 128, "fallback is rounded, translucent and stronger when focused");
+
+    PanelCanvas canvas;
+    HDC dc = canvas.Prepare(width, height);
+    Check(dc != nullptr, "allocate selection test canvas");
+    Check(SetPixelV(dc, width / 2, height / 2, RGB(230, 220, 210)), "draw foreground test pixel");
+    canvas.NormalizeAlpha();
+    RECT row{0, 0, width, height}, clip{0, 0, width, height - 1};
+    canvas.CompositeBackground(row, clip, active);
+    auto pixels = canvas.Pixels();
+    Check(pixels[center] == 0xFFE6DCD2 && pixels[center + 1] == active[center + 1],
+        "selection fills the background without tinting foreground pixels");
+    Check(pixels[0] == canvasBackground && pixels.back() == canvasBackground,
+        "selection preserves hit-test alpha at rounded corners and outside the viewport");
+    auto contrast = style.Pixels(nullptr, width, height, 96, true, true);
+    Check((contrast[center] >> 24) == 255, "high contrast uses solid system selection");
+}
+
+void TestRowSizing() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    Check(InitCommonControlsEx(&controls), "initialize native row sizing test");
+    HWND list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_OWNERDATA |
+        LVS_NOCOLUMNHEADER | LVS_SHAREIMAGELISTS, 0, 0, 420, 240, HWND_MESSAGE, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    Check(list != nullptr, "create native list for row sizing");
+    LVCOLUMNW column{};
+    column.mask = LVCF_WIDTH;
+    column.cx = 400;
+    Check(ListView_InsertColumn(list, 0, &column) >= 0, "create native list column");
+
+    ListRowSizing sizing;
+    for (UINT dpi : {96u, 144u, 192u}) {
+        int iconSize = MulDiv(16, dpi, 96);
+        auto images = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 0);
+        Check(images != nullptr && ImageList_SetImageCount(images, 1), "create base image list");
+        ListView_SetImageList(list, images, LVSIL_SMALL);
+        ListView_SetItemCount(list, 4);
+        RECT before{}, after{};
+        Check(ListView_GetItemRect(list, 0, &before, LVIR_BOUNDS), "measure unpadded row");
+        ListView_SetItemCount(list, 0);
+        int padding = MulDiv(6, dpi, 96);
+        sizing.Update(list, images, padding);
+        ListView_SetItemCount(list, 4);
+        Check(ListView_GetItemRect(list, 0, &after, LVIR_BOUNDS) &&
+            (after.bottom - after.top) - (before.bottom - before.top) == padding,
+            "native row height increases by six logical pixels");
+        ListView_SetImageList(list, nullptr, LVSIL_SMALL);
+        ImageList_Destroy(images);
+    }
+    DestroyWindow(list);
 }
 
 void TestSettings(const std::filesystem::path& root) {
@@ -176,6 +252,158 @@ void TestSettings(const std::filesystem::path& root) {
     Check(!settings::Write((root / L"missing" / ini.filename()).wstring(), original),
         "saving fails cleanly when the target directory is unavailable");
 }
+
+void TestStartupRegistration() {
+    struct RegistryFixture {
+        std::wstring path = L"Software\\DesktopJunction.StartupTest." + std::to_wstring(GetCurrentProcessId()) +
+            L"." + std::to_wstring(GetTickCount64());
+        ~RegistryFixture() { RegDeleteKeyW(HKEY_CURRENT_USER, path.c_str()); }
+    } fixture;
+    const auto* key = fixture.path.c_str();
+    HKEY temporary = nullptr;
+    Check(RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, nullptr, REG_OPTION_VOLATILE, KEY_SET_VALUE,
+        nullptr, &temporary, nullptr) == ERROR_SUCCESS, "create isolated startup registration key");
+    RegCloseKey(temporary);
+    std::wstring exe = L"C:\\Program Files\\桌面映射\\DesktopJunction.exe";
+    std::wstring other = L"D:\\Portable\\DesktopJunction.exe";
+    Check(startup::IsEnabled(exe, key) == false, "startup defaults to unchecked");
+    Check(startup::SetEnabled(exe, true, key) == ERROR_SUCCESS && startup::IsEnabled(exe, key) == true,
+        "register and read back executable with spaces and Unicode");
+    wchar_t command[261]{};
+    DWORD bytes = sizeof(command);
+    Check(RegGetValueW(HKEY_CURRENT_USER, key, L"DesktopJunction", RRF_RT_REG_SZ, nullptr, command, &bytes) ==
+        ERROR_SUCCESS && command == L"\"" + exe + L"\"", "startup command quotes the absolute executable path");
+    Check(startup::IsEnabled(other, key) == false && startup::SetEnabled(other, false, key) == ERROR_SUCCESS &&
+        startup::IsEnabled(exe, key) == true, "a different executable does not unregister this copy");
+    Check(startup::SetEnabled(other, true, key) == ERROR_SUCCESS && startup::IsEnabled(other, key) == true &&
+        startup::IsEnabled(exe, key) == false, "re-enabling after relocation updates the startup command");
+    Check(startup::SetEnabled(other, false, key) == ERROR_SUCCESS && startup::IsEnabled(other, key) == false,
+        "unregister the startup value");
+}
+
+void TestReadOnlyTransfer(const std::filesystem::path& root) {
+    auto source = root / L"transfer-source";
+    auto target = root / L"transfer-target";
+    std::filesystem::create_directory(source);
+    std::filesystem::create_directory(target);
+    auto name = L"只读附件.txt";
+    auto input = source / name;
+    auto output = target / name;
+    CreateFileWithTime(input, 1);
+    Check(SetFileAttributesW(input.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+        "mark fixture read-only");
+    auto snapshot = folder::Read(source.wstring());
+    Check(snapshot.entries.size() == 1 && folder::IsReadOnlyFile(snapshot.entries.front().attributes),
+        "read-only badge uses enumeration attributes");
+
+    auto copy = shell::TransferToFolder(nullptr, source.wstring(), {name}, target.wstring(), DROPEFFECT_COPY);
+    Check(SUCCEEDED(copy.transfer) && SUCCEEDED(copy.unlock) && std::filesystem::exists(output),
+        "copy read-only file through the desktop drop operation");
+    auto copied = GetFileAttributesW(output.c_str());
+    Check((copied & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE)) == FILE_ATTRIBUTE_ARCHIVE &&
+        folder::IsReadOnlyFile(GetFileAttributesW(input.c_str())), "copy unlocks destination and preserves source");
+    std::filesystem::remove(output);
+
+    auto move = shell::TransferToFolder(nullptr, source.wstring(), {name}, target.wstring(), DROPEFFECT_MOVE);
+    Check(SUCCEEDED(move.transfer) && SUCCEEDED(move.unlock) && std::filesystem::exists(output) &&
+        !std::filesystem::exists(input), "move read-only file through the desktop drop operation");
+    auto moved = GetFileAttributesW(output.c_str());
+    Check((moved & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE)) == FILE_ATTRIBUTE_ARCHIVE,
+        "move clears only the read-only bit");
+
+    CreateFileWithTime(input, 2);
+    Check(SetFileAttributesW(input.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+        "mark native drag fixture read-only");
+    auto identity = folder::ReadOnlyIdentity(input.wstring());
+    Check(identity.has_value(), "read native drag file identity");
+    std::filesystem::remove(output);
+    Check(CopyFileW(input.c_str(), output.c_str(), TRUE), "copy native drag fixture");
+    Check(!folder::ClearReadOnlyAfterMove(input.wstring(), output.wstring(), *identity) &&
+        folder::IsReadOnlyFile(GetFileAttributesW(output.c_str())), "native copy is not treated as a move");
+
+    auto displaced = source / L"elsewhere.txt";
+    Check(MoveFileW(input.c_str(), displaced.c_str()), "move fixture elsewhere");
+    Check(!folder::ClearReadOnlyAfterMove(input.wstring(), output.wstring(), *identity) &&
+        folder::IsReadOnlyFile(GetFileAttributesW(output.c_str())), "unrelated same-name destination stays read-only");
+    Check(folder::ClearReadOnly(output.wstring()) == ERROR_SUCCESS, "release copied fixture");
+    std::filesystem::remove(output);
+    Check(MoveFileW(displaced.c_str(), output.c_str()), "move original fixture to destination");
+    Check(folder::ClearReadOnlyAfterMove(input.wstring(), output.wstring(), *identity) == ERROR_SUCCESS &&
+        !folder::IsReadOnlyFile(GetFileAttributesW(output.c_str())), "confirmed native move clears read-only");
+}
+
+void TestNativeDesktopCopies(const std::filesystem::path& root) {
+    using namespace std::chrono_literals;
+    auto source = root / L"native-copy-source";
+    auto desktop = root / L"native-copy-desktop";
+    std::filesystem::create_directory(source);
+    std::filesystem::create_directory(desktop);
+    const wchar_t* name = L"只读副本.txt";
+    auto input = source / name;
+    auto output = desktop / name;
+    auto write = [](const auto& path, const char* contents) {
+        std::ofstream file(path, std::ios::binary);
+        file << contents;
+        file.close();
+        Check(bool(file) && SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+            "create read-only copy fixture");
+    };
+    auto readOnly = [&] { return folder::IsReadOnlyFile(GetFileAttributesW(output.c_str())); };
+    auto waitForUnlock = [&] {
+        auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (readOnly() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(20ms);
+        Check(!readOnly() && std::filesystem::exists(output), "verified native copy unlocks destination");
+        Check(folder::IsReadOnlyFile(GetFileAttributesW(input.c_str())), "native copy preserves source read-only");
+        std::filesystem::remove(output);
+    };
+    write(input, "real contents");
+    {
+        folder::DesktopCopies clipboard(source.wstring(), desktop.wstring(), {name}, {0}, false);
+        clipboard.Activate();
+        Check(CopyFileW(input.c_str(), output.c_str(), TRUE), "native clipboard copy");
+        waitForUnlock();
+    }
+    {
+        folder::DesktopCopies clipboard(source.wstring(), desktop.wstring(), {name}, {0}, false);
+        clipboard.Activate();
+        {
+            std::ofstream file(output, std::ios::binary);
+            file << "real contents";
+        }
+        std::this_thread::sleep_for(150ms);
+        Check(SetFileAttributesW(output.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+            "native copy applies attributes after creating destination");
+        waitForUnlock();
+    }
+    {
+        folder::DesktopCopies drag(source.wstring(), desktop.wstring(), {name}, {0}, true);
+        Check(CopyFileW(input.c_str(), output.c_str(), TRUE), "native drag copy");
+        std::this_thread::sleep_for(100ms);
+        Check(readOnly(), "drag observer waits for OLE copy completion");
+        drag.Activate();
+        waitForUnlock();
+    }
+    {
+        folder::DesktopCopies clipboard(source.wstring(), desktop.wstring(), {name}, {0}, false);
+        clipboard.Activate();
+        write(output, "fake contents");
+        std::this_thread::sleep_for(500ms);
+        Check(readOnly(), "same-name unrelated contents remain read-only");
+        Check(folder::ClearReadOnly(output.wstring()) == ERROR_SUCCESS, "release unrelated fixture");
+        std::filesystem::remove(output);
+    }
+    {
+        write(output, "real contents");
+        folder::DesktopCopies clipboard(source.wstring(), desktop.wstring(), {name}, {0}, false);
+        clipboard.Activate();
+        Check(SetFileAttributesW(output.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN),
+            "modify attributes of pre-existing destination");
+        std::this_thread::sleep_for(500ms);
+        Check(readOnly(), "pre-existing file with identical contents stays read-only");
+    }
+    Check(folder::ClearReadOnly(output.wstring()) == ERROR_SUCCESS &&
+        folder::ClearReadOnly(input.wstring()) == ERROR_SUCCESS, "release native copy fixtures");
+}
 }
 
 int main() {
@@ -183,8 +411,21 @@ int main() {
         Fixture fixture;
         Test(fixture.path);
         TestResources(fixture.path);
+        TestSelectionCompositing();
+        TestRowSizing();
         TestSettings(fixture.path);
-        std::cout << "Folder, resource, and settings tests passed\n";
+        TestStartupRegistration();
+        TestNativeDesktopCopies(fixture.path);
+        HRESULT ole = OleInitialize(nullptr);
+        Check(SUCCEEDED(ole), "initialize Shell transfer tests");
+        try {
+            TestReadOnlyTransfer(fixture.path);
+        } catch (...) {
+            OleUninitialize();
+            throw;
+        }
+        OleUninitialize();
+        std::cout << "Folder, resource, settings, and transfer tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

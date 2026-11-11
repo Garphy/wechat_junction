@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -21,6 +22,11 @@ struct Entry {
     DWORD attributes;
 };
 
+constexpr bool IsReadOnlyFile(DWORD attributes) {
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)) == FILE_ATTRIBUTE_READONLY;
+}
+
 struct Snapshot {
     std::wstring path;
     std::vector<Entry> entries;
@@ -33,6 +39,22 @@ std::wstring Resolve(const Source& source, const SYSTEMTIME& local);
 UINT MillisecondsUntilMonth(const SYSTEMTIME& local);
 std::wstring Join(const std::wstring& path, const std::wstring& name);
 Snapshot Read(const std::wstring& path);
+DWORD ClearReadOnly(const std::wstring& path);
+std::optional<FILE_ID_INFO> ReadOnlyIdentity(const std::wstring& path);
+std::optional<DWORD> ClearReadOnlyAfterMove(const std::wstring& source, const std::wstring& destination,
+    const FILE_ID_INFO& original);
+
+class DesktopCopies {
+public:
+    DesktopCopies(const std::wstring& source, const std::wstring& desktop, const std::vector<std::wstring>& names,
+        const std::vector<size_t>& readOnly, bool waitForDrop);
+    ~DesktopCopies();
+    void Activate();
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
 
 class Monitor {
 public:

@@ -13,6 +13,7 @@
 #include <oleacc.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,6 +28,11 @@ constexpr UINT chooseMessage = WM_APP + 5;
 constexpr UINT paintMessage = WM_APP + 6;
 constexpr UINT_PTR monthTimer = 2;
 constexpr UINT_PTR placementTimer = 3;
+constexpr UINT placementChecks[] = {2000, 5000, 12000, 30000};
+constexpr int borderWidth = 1;
+constexpr COLORREF borderColor = RGB(51, 51, 51);
+constexpr COLORREF scrollbarColor = RGB(153, 153, 153);
+constexpr int scrollbarBorderGap = 1;
 constexpr int pinId = 200, chooseId = 201, listId = 202, closeId = 203;
 void DrawPill(HDC dc, const RECT& area, int radius, COLORREF fill) {
     auto brush = SelectObject(dc, GetStockObject(DC_BRUSH));
@@ -135,6 +141,7 @@ private:
     void RequestPaint();
     void DrawToolbar(HDC dc, const RECT& area);
     void DrawRows(HDC dc);
+    bool ScrollbarBounds(RECT& track, RECT& thumb) const;
     void DrawScrollbar(HDC dc);
     void UpdateAppearance();
     void RefreshSelectionStyle();
@@ -145,7 +152,8 @@ private:
     void UpdateDpi(UINT dpi);
     void Place(RECT bounds);
     bool RestorePlacement();
-    void SchedulePlacement();
+    void BeginPlacementRecovery();
+    void CheckPlacement();
     void RememberPlacement();
     void Save(bool report = false);
     void AddTray();
@@ -179,6 +187,7 @@ private:
     HWND window_ = nullptr, list_ = nullptr, pin_ = nullptr, choose_ = nullptr, close_ = nullptr;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     UINT taskbarCreated_ = 0;
+    HPOWERNOTIFY displayPower_ = nullptr;
     HFONT font_ = nullptr, iconFont_ = nullptr;
     HICON icon_ = nullptr;
     HICON trayIcon_ = nullptr;
@@ -194,9 +203,10 @@ private:
     SIZE layoutSize_{};
     HWND hoveredButton_ = nullptr;
     bool trayAdded_ = false, busy_ = false, revealed_ = false, paintPending_ = false;
+    bool dropRegistered_ = false, dropHover_ = false;
     bool moving_ = false, placing_ = false;
-    RECT moveStart_{};
-    int placementRetries_ = 0;
+    RECT moveStart_{}, expectedPlacement_{};
+    ULONGLONG placementRecoveryStart_ = 0;
     unsigned generation_ = 0;
     std::wstring path_;
     folder::Snapshot snapshot_;
@@ -238,10 +248,16 @@ void Panel::Start() {
     monitor_ = std::make_unique<folder::Monitor>(window_);
     desktop_ = std::make_unique<DesktopLayer>(window_);
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
+    displayPower_ = RegisterPowerSettingNotification(window_, &GUID_SESSION_DISPLAY_STATUS, DEVICE_NOTIFY_WINDOW_HANDLE);
     if (IsRectEmpty(&settings_.bounds)) RememberPlacement();
     AddTray();
     RefreshSource();
+    if (auto* target = shell::CreateFolderDropTarget(window_, path_, busy_)) {
+        dropRegistered_ = SUCCEEDED(RegisterDragDrop(list_, target));
+        target->Release();
+    }
     Show(false);
+    BeginPlacementRecovery();
     if (importedSettings_) Save(true);
     if (settings_.source.path.empty()) PostMessageW(window_, chooseMessage, 0, 0);
 }
@@ -344,7 +360,10 @@ LRESULT Panel::HitTest(POINT point) const {
     if (point.y < grip) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
     if (point.y >= area.bottom - grip) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
     if (left) return HTLEFT;
-    if (right) return HTRIGHT;
+    if (right) {
+        RECT track{}, thumb{};
+        return ScrollbarBounds(track, thumb) && PtInRect(&track, point) ? HTCLIENT : HTRIGHT;
+    }
     if (point.y < HeaderHeight() && ChildWindowFromPointEx(window_, point, CWP_SKIPINVISIBLE) == window_) {
         return HTCAPTION;
     }
@@ -357,7 +376,9 @@ void Panel::PaintFrame() {
     GetClientRect(window_, &area);
     HDC dc = canvas_.Prepare(area.right, area.bottom);
     if (!dc) return;
-    FrameRect(dc, &area, GetSysColorBrush(COLOR_3DSHADOW));
+    auto frameColor = highContrast_ ? GetSysColor(COLOR_WINDOWTEXT) : borderColor;
+    SetDCBrushColor(dc, dropHover_ ? GetSysColor(COLOR_HIGHLIGHT) : frameColor);
+    FrameRect(dc, &area, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     DrawToolbar(dc, area);
     selectedRows_.clear();
     DrawRows(dc);
@@ -430,20 +451,34 @@ void Panel::DrawRows(HDC dc) {
     RestoreDC(dc, saved);
 }
 
-void Panel::DrawScrollbar(HDC dc) {
+bool Panel::ScrollbarBounds(RECT& track, RECT& thumb) const {
     SCROLLBARINFO info{};
     info.cbSize = sizeof(info);
     if (!GetScrollBarInfo(list_, OBJID_VSCROLL, &info) ||
         (info.rgstate[0] & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN | STATE_SYSTEM_UNAVAILABLE)) ||
-        info.xyThumbBottom <= info.xyThumbTop) return;
-    auto track = info.rcScrollBar;
+        info.xyThumbBottom <= info.xyThumbTop) return false;
+
+    RECT listBounds{}, listClient{};
+    if (!GetWindowRect(list_, &listBounds) || !GetClientRect(list_, &listClient)) return false;
+    POINT clientRight{listClient.right, 0};
+    if (!ClientToScreen(list_, &clientRight) || clientRight.x >= listBounds.right) return false;
+
+    // Use the actual nonclient strip for the horizontal bounds after a DPI change.
+    track = info.rcScrollBar;
+    track.left = clientRight.x;
+    track.right = listBounds.right;
     MapWindowPoints(nullptr, window_, reinterpret_cast<POINT*>(&track), 2);
-    int width = std::max(2, Dip(4));
-    LONG left = (track.left + track.right - width) / 2;
-    RECT thumb{left, track.top + info.xyThumbTop, left + width, track.top + info.xyThumbBottom};
-    FrameRect(dc, &thumb, GetSysColorBrush(COLOR_3DSHADOW));
-    InflateRect(&thumb, -1, -1);
-    DrawPill(dc, thumb, width, RGB(210, 215, 222));
+    LONG thumbRight = track.right - scrollbarBorderGap;
+    thumb = {std::max(track.left, thumbRight - Dip(2)), track.top + info.xyThumbTop,
+        thumbRight, track.top + info.xyThumbBottom};
+    return true;
+}
+
+void Panel::DrawScrollbar(HDC dc) {
+    RECT track{}, thumb{};
+    if (!ScrollbarBounds(track, thumb)) return;
+    SetDCBrushColor(dc, highContrast_ ? GetSysColor(COLOR_WINDOWTEXT) : scrollbarColor);
+    FillRect(dc, &thumb, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
 
 void Panel::Layout() {
@@ -454,7 +489,7 @@ void Panel::Layout() {
     int padding = Dip(8);
     int buttonHeight = Dip(22);
     int buttonTop = (HeaderHeight() - buttonHeight) / 2;
-    int width = std::max(0, int(area.right) - 2 * padding);
+    int width = std::max(0, int(area.right) - padding - borderWidth);
     int right = area.right - padding;
     MoveWindow(close_, right - Dip(24), buttonTop, Dip(24), buttonHeight, TRUE);
     MoveWindow(pin_, right - Dip(57), buttonTop, Dip(30), buttonHeight, TRUE);
@@ -510,13 +545,30 @@ bool Panel::RestorePlacement() {
     if (MonitorFromWindow(window_, MONITOR_DEFAULTTONULL) != target) return false;
     UpdateDpi(GetDpiForWindow(window_));
     auto origin = settings_.workOrigin.value_or(POINT{info.rcWork.left, info.rcWork.top});
-    Place(placement::ScaleToWorkArea(settings_.bounds, origin, settings_.dpi, info.rcWork, dpi_));
+    expectedPlacement_ = placement::ScaleToWorkArea(settings_.bounds, origin, settings_.dpi, info.rcWork, dpi_);
+    Place(expectedPlacement_);
     return preferredAvailable;
 }
 
-void Panel::SchedulePlacement() {
-    placementRetries_ = 2;
+void Panel::BeginPlacementRecovery() {
+    placementRecoveryStart_ = GetTickCount64();
     SetTimer(window_, placementTimer, 300, nullptr);
+}
+
+void Panel::CheckPlacement() {
+    KillTimer(window_, placementTimer);
+    if (!placementRecoveryStart_) return;
+    RestorePlacement();
+
+    // Explorer and the display driver can update the layout after the first successful restore.
+    auto elapsed = GetTickCount64() - placementRecoveryStart_;
+    for (UINT check : placementChecks) {
+        if (elapsed < check) {
+            SetTimer(window_, placementTimer, check - static_cast<UINT>(elapsed), nullptr);
+            return;
+        }
+    }
+    placementRecoveryStart_ = 0;
 }
 
 void Panel::RememberPlacement() {
@@ -526,6 +578,7 @@ void Panel::RememberPlacement() {
     if (!ReadMonitor(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), info)) return;
     bounds = placement::Fit(bounds, info.rcWork);
     Place(bounds);
+    expectedPlacement_ = bounds;
     UpdateDpi(GetDpiForWindow(window_));
     settings_.bounds = bounds;
     settings_.dpi = dpi_;
@@ -584,7 +637,7 @@ void Panel::TrayMenu() {
 
 void Panel::Show(bool activate) {
     ShowWindow(window_, SW_SHOWNOACTIVATE);
-    if (!RestorePlacement()) SchedulePlacement();
+    if (!RestorePlacement()) BeginPlacementRecovery();
     RequestPaint();
     if (activate) {
         SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
@@ -890,6 +943,7 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     if (taskbarCreated_ && message == taskbarCreated_) {
         AddTray();
         UpdateAppearance();
+        BeginPlacementRecovery();
         PostMessageW(window_, DesktopLayer::changed, TRUE, 0);
         return 0;
     }
@@ -907,6 +961,10 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         paintPending_ = false;
         PaintFrame();
         return 0;
+    case shell::dropHoverChanged:
+        dropHover_ = wParam != 0;
+        RequestPaint();
+        return 0;
     case WM_ERASEBKGND: return TRUE;
     case WM_SHOWWINDOW:
         if (!wParam) {
@@ -923,15 +981,27 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (layoutSize_.cx != LOWORD(lParam) || layoutSize_.cy != HIWORD(lParam)) Layout();
         if (wParam == SIZE_MINIMIZED) PostMessageW(window_, DesktopLayer::changed, TRUE, 0);
         return 0;
+    case WM_WINDOWPOSCHANGED: {
+        const auto& position = *reinterpret_cast<const WINDOWPOS*>(lParam);
+        constexpr UINT unchanged = SWP_NOMOVE | SWP_NOSIZE;
+        if (placementRecoveryStart_ && !moving_ && !placing_ && !IsIconic(window_) &&
+            (position.flags & unchanged) != unchanged) {
+            RECT actual{};
+            if (GetWindowRect(window_, &actual) && !EqualRect(&actual, &expectedPlacement_)) {
+                SetTimer(window_, placementTimer, 300, nullptr);
+            }
+        }
+        break;
+    }
     case WM_DPICHANGED:
         UpdateDpi(HIWORD(wParam));
         if (!placing_) {
             if (moving_) Place(*reinterpret_cast<const RECT*>(lParam));
-            else SchedulePlacement();
+            else BeginPlacementRecovery();
         }
         return 0;
     case WM_DISPLAYCHANGE:
-        SchedulePlacement();
+        BeginPlacementRecovery();
         return 0;
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETICONTITLELOGFONT) {
@@ -941,7 +1011,7 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (!wParam || wParam == SPI_SETDESKWALLPAPER || wParam == SPI_SETHIGHCONTRAST) UpdateAppearance();
         if (wParam == SPI_SETHIGHCONTRAST) RefreshSelectionStyle();
-        if (wParam == SPI_SETWORKAREA) SchedulePlacement();
+        if (wParam == SPI_SETWORKAREA) BeginPlacementRecovery();
         if (lParam && !wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"intl")) RefreshSource();
         break;
     case WM_SYSCOLORCHANGE:
@@ -978,11 +1048,7 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         } else if (wParam == monthTimer) {
             RefreshSource();
         } else if (wParam == placementTimer) {
-            KillTimer(window_, placementTimer);
-            if (!RestorePlacement() && placementRetries_ > 0) {
-                --placementRetries_;
-                SetTimer(window_, placementTimer, 2000, nullptr);
-            }
+            CheckPlacement();
         }
         return 0;
     case WM_TIMECHANGE:
@@ -990,8 +1056,15 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_POWERBROADCAST:
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
-            SchedulePlacement();
+            BeginPlacementRecovery();
             RefreshSource();
+        } else if (wParam == PBT_POWERSETTINGCHANGE && lParam) {
+            const auto& setting = *reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+            if (setting.PowerSetting == GUID_SESSION_DISPLAY_STATUS && setting.DataLength == sizeof(DWORD)) {
+                DWORD state = 0;
+                std::memcpy(&state, setting.Data, sizeof(state));
+                if (state == PowerMonitorOn) BeginPlacementRecovery();
+            }
         }
         return TRUE;
     case folder::Monitor::ready:
@@ -1045,6 +1118,8 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam) Save();
         return 0;
     case WM_DESTROY: {
+        if (dropRegistered_) RevokeDragDrop(list_);
+        if (displayPower_) UnregisterPowerSettingNotification(displayPower_);
         if (monitor_) Save();
         desktop_.reset();
         monitor_.reset();

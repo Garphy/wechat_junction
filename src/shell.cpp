@@ -9,6 +9,7 @@
 #include <sherrors.h>
 
 #include <memory>
+#include <new>
 #include <system_error>
 #include <utility>
 
@@ -18,13 +19,14 @@ template<class T>
 class Com {
 public:
     Com() = default;
-    ~Com() { if (value_) value_->Release(); }
+    ~Com() { Reset(); }
     Com(const Com&) = delete;
     Com& operator=(const Com&) = delete;
     T** Out() { return &value_; }
     T* Get() const { return value_; }
     T* operator->() const { return value_; }
     explicit operator bool() const { return value_ != nullptr; }
+    void Reset() { if (auto value = std::exchange(value_, nullptr)) value->Release(); }
 private:
     T* value_ = nullptr;
 };
@@ -218,6 +220,138 @@ private:
     DWORD feedback_ = DROPEFFECT_NONE;
     DWORD desktopEffect_ = DROPEFFECT_NONE;
     bool copyAtRelease_ = false;
+};
+
+class FolderDropTarget final : public IDropTarget {
+public:
+    FolderDropTarget(HWND owner, const std::wstring& directory, bool& busy)
+        : owner_(owner), directory_(directory), busy_(busy) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (iid != IID_IUnknown && iid != IID_IDropTarget) return E_NOINTERFACE;
+        *result = static_cast<IDropTarget*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = --references_;
+        if (!remaining) delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        DragLeave();
+        allowed_ = *effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE);
+        buttons_ = keys & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON);
+        *effect = DROPEFFECT_NONE;
+        FORMATETC files{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        if (busy_ || !allowed_ || !data || data->QueryGetData(&files) != S_OK) return S_OK;
+        data->AddRef();
+        *data_.Out() = data;
+        EnterFolder(keys, point, *effect);
+        SetHover(*effect);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL point, DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        *effect &= allowed_;
+        if (busy_ || !data_) {
+            *effect = DROPEFFECT_NONE;
+        } else if (destination_ != directory_) {
+            EnterFolder(keys, point, *effect);
+        } else if (!target_ || FAILED(target_->DragOver(keys, point, effect))) {
+            *effect = DROPEFFECT_NONE;
+        }
+        SetHover(*effect);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        LeaveFolder();
+        data_.Reset();
+        SetHover(DROPEFFECT_NONE);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        SetHover(DROPEFFECT_NONE);
+        DWORD allowed = *effect & allowed_;
+        *effect = DROPEFFECT_NONE;
+        if (busy_ || !data || !data_ || !allowed) return DragLeave();
+
+        // Read the live mapping again, even if OLE has not delivered another DragOver.
+        if (destination_ != directory_) {
+            DWORD preview = allowed;
+            EnterFolder(keys | buttons_, point, preview);
+        }
+        if (!target_) return DragLeave();
+
+        *effect = allowed;
+        busy_ = true;
+        HRESULT result = target_->Drop(data, keys, point, effect);
+        busy_ = false;
+        target_.Reset();
+        DragLeave();
+        PostMessageW(owner_, folder::Monitor::ready, 0, 0);
+        if (FAILED(result) || result == DRAGDROP_S_CANCEL) *effect = DROPEFFECT_NONE;
+        return result;
+    }
+
+private:
+    void LeaveFolder() {
+        if (target_) target_->DragLeave();
+        target_.Reset();
+        destination_.clear();
+    }
+
+    void EnterFolder(DWORD keys, POINTL point, DWORD& effect) {
+        LeaveFolder();
+        effect = DROPEFFECT_NONE;
+        try {
+            destination_ = directory_;
+        } catch (const std::bad_alloc&) {
+            return;
+        }
+        if (destination_.empty()) return;
+        auto pidl = Parse(destination_);
+        if (!pidl) return;
+        Com<IShellFolder> desktop, folder;
+        if (FAILED(SHGetDesktopFolder(desktop.Out()))) return;
+        if (!ILIsEmpty(pidl.get()) && FAILED(desktop->BindToObject(pidl.get(), nullptr, IID_IShellFolder,
+                reinterpret_cast<void**>(folder.Out())))) return;
+        auto* parent = folder ? folder.Get() : desktop.Get();
+        if (FAILED(parent->CreateViewObject(owner_, IID_IDropTarget, reinterpret_cast<void**>(target_.Out()))) || !target_) {
+            target_.Reset();
+            return;
+        }
+        effect = allowed_;
+        if (FAILED(target_->DragEnter(data_.Get(), keys, point, &effect))) {
+            target_.Reset();
+            effect = DROPEFFECT_NONE;
+        }
+    }
+
+    void SetHover(DWORD effect) {
+        bool hover = (effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE)) != 0;
+        if (std::exchange(hover_, hover) != hover) SendMessageW(owner_, dropHoverChanged, hover, 0);
+    }
+
+    ULONG references_ = 1;
+    HWND owner_;
+    const std::wstring& directory_;
+    bool& busy_;
+    bool hover_ = false;
+    DWORD allowed_ = DROPEFFECT_NONE;
+    DWORD buttons_ = 0;
+    std::wstring destination_;
+    Com<IDataObject> data_;
+    Com<IDropTarget> target_;
 };
 
 class ClipboardCopyData final : public IDataObject, public IDataObjectAsyncCapability {
@@ -421,6 +555,10 @@ TransferResult TransferToFolder(HWND owner, const std::wstring& directory,
     }
     if (SUCCEEDED(hr)) hr = operation->PerformOperations();
     return {hr, sink->Error()};
+}
+
+IDropTarget* CreateFolderDropTarget(HWND owner, const std::wstring& directory, bool& busy) {
+    return new (std::nothrow) FolderDropTarget(owner, directory, busy);
 }
 
 std::optional<FolderChoice> ChooseFolder(HWND owner, const std::wstring& initial, bool monthly) {

@@ -336,6 +336,73 @@ void TestStartupRegistration() {
         "unregister the startup value");
 }
 
+void TestFolderDrop(const std::filesystem::path& root) {
+    auto source = root / L"incoming";
+    auto oldMonth = root / L"2026-11";
+    auto newMonth = root / L"2026-12";
+    std::filesystem::create_directories(source);
+    std::filesystem::create_directories(oldMonth);
+    std::filesystem::create_directories(newMonth);
+    auto file = source / L"拖回.txt";
+    CreateFileWithTime(file, 1);
+    auto childFolder = source / L"子目录";
+    std::filesystem::create_directory(childFolder);
+    CreateFileWithTime(childFolder / L"附件.txt", 2);
+
+    auto freePidl = [](ITEMIDLIST* pidl) { CoTaskMemFree(pidl); };
+    std::unique_ptr<ITEMIDLIST, decltype(freePidl)> parent(ILCreateFromPathW(source.c_str()));
+    std::unique_ptr<ITEMIDLIST, decltype(freePidl)> item(ILCreateFromPathW(file.c_str()));
+    std::unique_ptr<ITEMIDLIST, decltype(freePidl)> directoryItem(ILCreateFromPathW(childFolder.c_str()));
+    Check(parent && item && directoryItem, "resolve native incoming drag paths");
+    PCUITEMID_CHILD children[] = {ILFindLastID(item.get()), ILFindLastID(directoryItem.get())};
+    auto createData = [&](UINT count) {
+        IDataObject* object = nullptr;
+        Check(SUCCEEDED(SHCreateDataObject(parent.get(), count, children, nullptr, IID_IDataObject,
+            reinterpret_cast<void**>(&object))), "create Explorer-style drag data");
+        return std::unique_ptr<IDataObject, decltype([](IDataObject* data) { data->Release(); })>(object);
+    };
+
+    auto destroyOwner = [](HWND owner) { DestroyWindow(owner); };
+    std::unique_ptr<std::remove_pointer_t<HWND>, decltype(destroyOwner)> owner(CreateWindowExW(WS_EX_TOOLWINDOW,
+        L"STATIC", L"", WS_POPUP, 0, 0, 120, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr));
+    Check(owner != nullptr, "create incoming drop window");
+    std::wstring mapped = oldMonth.wstring();
+    bool busy = false;
+    std::unique_ptr<IDropTarget, decltype([](IDropTarget* drop) { drop->Release(); })>
+        drop(shell::CreateFolderDropTarget(owner.get(), mapped, busy));
+    Check(drop && SUCCEEDED(RegisterDragDrop(owner.get(), drop.get())), "register incoming drop window with OLE");
+    auto revoke = [](HWND window) { RevokeDragDrop(window); };
+    std::unique_ptr<std::remove_pointer_t<HWND>, decltype(revoke)> registration(owner.get());
+
+    constexpr DWORD allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    POINTL point{10, 10};
+    auto data = createData(1);
+    DWORD effect = allowed;
+    busy = true;
+    Check(SUCCEEDED(drop->DragEnter(data.get(), MK_LBUTTON, point, &effect)) && effect == DROPEFFECT_NONE,
+        "ignore drags that originated in the panel");
+    busy = false;
+    effect = allowed;
+    Check(SUCCEEDED(drop->DragEnter(data.get(), MK_LBUTTON | MK_CONTROL, point, &effect)) &&
+        effect == DROPEFFECT_COPY, "Ctrl drag into the panel previews a copy");
+    mapped = newMonth.wstring();
+    effect = allowed;
+    Check(SUCCEEDED(drop->Drop(data.get(), MK_CONTROL, point, &effect)) && effect == DROPEFFECT_COPY &&
+        std::filesystem::exists(file) && std::filesystem::exists(newMonth / file.filename()) &&
+        !std::filesystem::exists(oldMonth / file.filename()), "copy goes to the directory mapped at drop time");
+
+    data = createData(2);
+    mapped = oldMonth.wstring();
+    effect = allowed;
+    Check(SUCCEEDED(drop->DragEnter(data.get(), MK_LBUTTON, point, &effect)) && effect == DROPEFFECT_MOVE,
+        "native same-volume default previews a move");
+    effect = allowed;
+    Check(SUCCEEDED(drop->Drop(data.get(), 0, point, &effect)) && std::filesystem::exists(oldMonth / file.filename()) &&
+        std::filesystem::exists(oldMonth / childFolder.filename() / L"附件.txt") &&
+        !std::filesystem::exists(file) && !std::filesystem::exists(childFolder),
+        "native same-volume drop moves a file and directory together");
+}
+
 void TestReadOnlyTransfer(const std::filesystem::path& root) {
     auto source = root / L"transfer-source";
     auto target = root / L"transfer-target";
@@ -476,6 +543,7 @@ int main() {
         HRESULT ole = OleInitialize(nullptr);
         Check(SUCCEEDED(ole), "initialize Shell transfer tests");
         try {
+            TestFolderDrop(fixture.path);
             TestReadOnlyTransfer(fixture.path);
         } catch (...) {
             OleUninitialize();

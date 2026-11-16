@@ -28,7 +28,9 @@ constexpr UINT chooseMessage = WM_APP + 5;
 constexpr UINT paintMessage = WM_APP + 6;
 constexpr UINT_PTR monthTimer = 2;
 constexpr UINT_PTR placementTimer = 3;
-constexpr UINT placementChecks[] = {2000, 5000, 12000, 30000};
+constexpr UINT placementDelay = 300;
+constexpr UINT placementRecoveryDuration = 30000;
+constexpr UINT placementChecks[] = {2000, 5000, 12000, placementRecoveryDuration};
 constexpr int borderWidth = 1;
 constexpr COLORREF borderColor = RGB(51, 51, 51);
 constexpr COLORREF scrollbarColor = RGB(153, 153, 153);
@@ -93,10 +95,9 @@ void RememberMonitor(settings::Values& settings, const MONITORINFOEXW& info) {
     settings.workOrigin = POINT{info.rcWork.left, info.rcWork.top};
 }
 
-RECT DefaultBounds() {
+RECT DefaultBounds(UINT dpi = USER_DEFAULT_SCREEN_DPI) {
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    auto dpi = GetDpiForSystem();
     int offset = MulDiv(24, dpi, 96);
     auto x = work.right - offset;
     auto y = work.top + offset;
@@ -116,7 +117,8 @@ struct FileIcon {
 
 class Panel {
 public:
-    explicit Panel(HINSTANCE instance) : instance_(instance), settingsPath_(settings::FilePath()),
+    explicit Panel(HINSTANCE instance, std::wstring settingsPath = settings::FilePath()) :
+        instance_(instance), settingsPath_(std::move(settingsPath)),
         settings_(settings::Load(settingsPath_, importedSettings_)) {}
     ~Panel() {
         if (window_) DestroyWindow(window_);
@@ -149,8 +151,8 @@ private:
     void FitColumn();
     void UpdateFont();
     void UpdateRowSpacing();
-    void UpdateDpi(UINT dpi);
-    void Place(RECT bounds);
+    bool UpdateDpi(UINT dpi);
+    void Place(RECT bounds, UINT dpi = 0);
     bool RestorePlacement();
     void BeginPlacementRecovery();
     void CheckPlacement();
@@ -249,15 +251,18 @@ void Panel::Start() {
     desktop_ = std::make_unique<DesktopLayer>(window_);
     taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     displayPower_ = RegisterPowerSettingNotification(window_, &GUID_SESSION_DISPLAY_STATUS, DEVICE_NOTIFY_WINDOW_HANDLE);
-    if (IsRectEmpty(&settings_.bounds)) RememberPlacement();
+    if (IsRectEmpty(&settings_.bounds)) {
+        Place(DefaultBounds(dpi_));
+        RememberPlacement();
+    }
     AddTray();
     RefreshSource();
     if (auto* target = shell::CreateFolderDropTarget(window_, path_, busy_)) {
         dropRegistered_ = SUCCEEDED(RegisterDragDrop(list_, target));
         target->Release();
     }
+    placementRecoveryStart_ = GetTickCount64();
     Show(false);
-    BeginPlacementRecovery();
     if (importedSettings_) Save(true);
     if (settings_.source.path.empty()) PostMessageW(window_, chooseMessage, 0, 0);
 }
@@ -302,7 +307,7 @@ bool Panel::CreateControls() {
         }
     }
     SendMessageW(pin_, BM_SETCHECK, settings_.pinned ? BST_CHECKED : BST_UNCHECKED, 0);
-    dpi_ = GetDpiForWindow(window_);
+    if (UINT dpi = GetDpiForWindow(window_)) dpi_ = dpi;
     UpdateFont();
     UpdateRowSpacing();
     RefreshSelectionStyle();
@@ -507,23 +512,32 @@ void Panel::FitColumn() {
     if (ListView_GetColumnWidth(list_, 0) != width) ListView_SetColumnWidth(list_, 0, width);
 }
 
-void Panel::Place(RECT bounds) {
+void Panel::Place(RECT bounds, UINT dpi) {
+    // Set the new DPI before SetWindowPos asks for the minimum tracking size.
+    bool dpiChanged = UpdateDpi(dpi);
     RECT current{};
-    if (GetWindowRect(window_, &current) && EqualRect(&current, &bounds)) return;
-    placing_ = true;
-    SetWindowPos(window_, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
-        bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
-    placing_ = false;
+    if (!GetWindowRect(window_, &current) || !EqualRect(&current, &bounds)) {
+        placing_ = true;
+        SetWindowPos(window_, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
+            bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        placing_ = false;
+    }
+
+    if (!dpi && UpdateDpi(GetDpiForWindow(window_))) dpiChanged = true;
+    RECT client{};
+    if (dpiChanged || (GetClientRect(window_, &client) &&
+        (layoutSize_.cx != client.right || layoutSize_.cy != client.bottom))) Layout();
 }
 
-void Panel::UpdateDpi(UINT dpi) {
-    if (!dpi || dpi_ == dpi) return;
+bool Panel::UpdateDpi(UINT dpi) {
+    if (!dpi || dpi_ == dpi) return false;
     dpi_ = dpi;
-    if (!list_) return;
-    selectionStyle_.Reset();
-    UpdateFont();
-    UpdateRowSpacing();
-    Layout();
+    if (list_) {
+        selectionStyle_.Reset();
+        UpdateFont();
+        UpdateRowSpacing();
+    }
+    return true;
 }
 
 bool Panel::RestorePlacement() {
@@ -543,24 +557,26 @@ bool Panel::RestorePlacement() {
         Place(placement::Fit(settings_.bounds, info.rcWork));
     }
     if (MonitorFromWindow(window_, MONITOR_DEFAULTTONULL) != target) return false;
-    UpdateDpi(GetDpiForWindow(window_));
+    UINT dpi = GetDpiForWindow(window_);
+    if (!dpi) return false;
     auto origin = settings_.workOrigin.value_or(POINT{info.rcWork.left, info.rcWork.top});
-    expectedPlacement_ = placement::ScaleToWorkArea(settings_.bounds, origin, settings_.dpi, info.rcWork, dpi_);
-    Place(expectedPlacement_);
-    return preferredAvailable;
+    expectedPlacement_ = placement::ScaleToWorkArea(settings_.bounds, origin, settings_.dpi, info.rcWork, dpi);
+    Place(expectedPlacement_, dpi);
+    RECT actual{};
+    return preferredAvailable && GetWindowRect(window_, &actual) && EqualRect(&actual, &expectedPlacement_) &&
+        MonitorFromWindow(window_, MONITOR_DEFAULTTONULL) == target && GetDpiForWindow(window_) == dpi;
 }
 
 void Panel::BeginPlacementRecovery() {
     placementRecoveryStart_ = GetTickCount64();
-    SetTimer(window_, placementTimer, 300, nullptr);
+    SetTimer(window_, placementTimer, placementDelay, nullptr);
 }
 
 void Panel::CheckPlacement() {
     KillTimer(window_, placementTimer);
-    if (!placementRecoveryStart_) return;
-    RestorePlacement();
+    if (!placementRecoveryStart_ || moving_ || RestorePlacement()) return;
 
-    // Explorer and the display driver can update the layout after the first successful restore.
+    // A display that is still starting may not be part of the current topology yet.
     auto elapsed = GetTickCount64() - placementRecoveryStart_;
     for (UINT check : placementChecks) {
         if (elapsed < check) {
@@ -579,7 +595,6 @@ void Panel::RememberPlacement() {
     bounds = placement::Fit(bounds, info.rcWork);
     Place(bounds);
     expectedPlacement_ = bounds;
-    UpdateDpi(GetDpiForWindow(window_));
     settings_.bounds = bounds;
     settings_.dpi = dpi_;
     RememberMonitor(settings_, info);
@@ -636,8 +651,8 @@ void Panel::TrayMenu() {
 }
 
 void Panel::Show(bool activate) {
-    ShowWindow(window_, SW_SHOWNOACTIVATE);
     if (!RestorePlacement()) BeginPlacementRecovery();
+    ShowWindow(window_, SW_SHOWNOACTIVATE);
     RequestPaint();
     if (activate) {
         SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
@@ -978,26 +993,26 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_SIZE:
-        if (layoutSize_.cx != LOWORD(lParam) || layoutSize_.cy != HIWORD(lParam)) Layout();
+        if (!placing_ && (layoutSize_.cx != LOWORD(lParam) || layoutSize_.cy != HIWORD(lParam))) Layout();
         if (wParam == SIZE_MINIMIZED) PostMessageW(window_, DesktopLayer::changed, TRUE, 0);
         return 0;
     case WM_WINDOWPOSCHANGED: {
         const auto& position = *reinterpret_cast<const WINDOWPOS*>(lParam);
         constexpr UINT unchanged = SWP_NOMOVE | SWP_NOSIZE;
-        if (placementRecoveryStart_ && !moving_ && !placing_ && !IsIconic(window_) &&
+        if (placementRecoveryStart_ && GetTickCount64() - placementRecoveryStart_ <= placementRecoveryDuration &&
+            !moving_ && !placing_ && !IsIconic(window_) &&
             (position.flags & unchanged) != unchanged) {
             RECT actual{};
             if (GetWindowRect(window_, &actual) && !EqualRect(&actual, &expectedPlacement_)) {
-                SetTimer(window_, placementTimer, 300, nullptr);
+                SetTimer(window_, placementTimer, placementDelay, nullptr);
             }
         }
         break;
     }
     case WM_DPICHANGED:
-        UpdateDpi(HIWORD(wParam));
         if (!placing_) {
-            if (moving_) Place(*reinterpret_cast<const RECT*>(lParam));
-            else BeginPlacementRecovery();
+            Place(*reinterpret_cast<const RECT*>(lParam), HIWORD(wParam));
+            if (!moving_) BeginPlacementRecovery();
         }
         return 0;
     case WM_DISPLAYCHANGE:
@@ -1027,6 +1042,10 @@ LRESULT Panel::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (std::exchange(moving_, false) && GetWindowRect(window_, &bounds) && !EqualRect(&moveStart_, &bounds)) {
             RememberPlacement();
             Save();
+            KillTimer(window_, placementTimer);
+            placementRecoveryStart_ = 0;
+        } else if (placementRecoveryStart_ && GetTickCount64() - placementRecoveryStart_ <= placementRecoveryDuration) {
+            SetTimer(window_, placementTimer, placementDelay, nullptr);
         }
         return 0;
     }
